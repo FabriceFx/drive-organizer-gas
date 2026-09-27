@@ -155,7 +155,7 @@ const FONCTIONS_EXPOSEES = [
   'doGet', 'rangementArreterApplication', 'rangementBalayerPage', 'rangementDefinirCleIa',
   'rangementDefinirDomainesInternes', 'rangementDemarrer', 'rangementDrivesPartages',
   'rangementEnregistrerReglages', 'rangementEtatPlan', 'rangementLancerApplication',
-  'rangementPoursuivreApplication', 'rangementPreparerPlan', 'rangementProposerIa',
+  'rangementPoursuivreApplication', 'rangementPreparerAnnulation', 'rangementPreparerPlan', 'rangementProposerIa',
   'rangementReinitialiserReglages', 'rangementReprendreApplication', 'rangementVerifierDeplacements',
 ];
 
@@ -916,7 +916,9 @@ const drivePourPlan = () => {
 
 /** Balayage par le serveur, analyse par le navigateur, préparation du plan : le vrai parcours. */
 const preparerPlan = (options = {}) => {
-  const ctx = chargerServeur({ fichiers: drivePourPlan(), racineId: 'root00', ...options });
+  const fichiers = drivePourPlan();
+  if (options.modifier) options.modifier(fichiers);
+  const ctx = chargerServeur({ fichiers, racineId: 'root00', ...options });
   const elements = [];
   let jeton = null;
   do {
@@ -1184,8 +1186,9 @@ verifier('un membre déjà présent est constaté, pas ajouté deux fois', () =>
 });
 
 verifier('verrou de la personne déjà pris : rien ne se fait', () => {
-  const { ctx, feuille } = preparerPlan({ verrouPris: true });
+  const { ctx, feuille } = preparerPlan();
   cocher(feuille);
+  ctx.verrouUtilisateur.pris = true;
   const r = ctx.lire('rangementLancerApplication')(ctx.lire('rangementEtatPlan')().valeur.aTraiter);
   vrai(r.ok);
   egal(r.valeur.refus, 'verrou');
@@ -1215,6 +1218,225 @@ verifier('déplacement vers un Drive partagé : constaté seulement quand Drive 
   vrai(ctx.lire('rangementVerifierDeplacements')().ok);
   egal(manuel()['État'], 'Fait (constaté)');
   egal(manuel()['ID Drive'], ctx.ecritures.drivesCrees[0].id);
+});
+
+/* --------------------------------------------------------------------------
+ * G bis. Défauts de la v0.2, trouvés à l'analyse de la v0.3
+ * ----------------------------------------------------------------------- */
+
+const noteEnPlus = (fichiers, id, nom) => fichiers.push({
+  ...fichiers.find((f) => f.id === 'fNote01'), id, name: nom,
+});
+
+verifier('défaut v0.2 : préparer un plan pendant qu\'une application tient le verrou est refusé', () => {
+  const { ctx, prep, proposition } = preparerPlan();
+  ctx.verrouUtilisateur.pris = true;
+  const avant = ctx.sheets.classeurs.size;
+  const r = ctx.lire('rangementPreparerPlan')(proposition);
+  egal(r.ok, false);
+  contient(r.message, 'application');
+  egal(ctx.sheets.classeurs.size, avant, 'aucun classeur créé');
+  egal(JSON.parse(ctx.magasins.user.get('RANGEMENT_PLAN')).id, prep.id, 'le plan courant ne change pas');
+});
+
+verifier('défaut v0.2 : une passe garde son plan, même si le pointeur change pendant qu\'elle tourne', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille);
+  const colonnes = ctx.lire('RANGEMENT_COLONNES_PLAN_');
+  const autre = ctx.sandbox.SpreadsheetApp.create('Autre plan');
+  autre.insertSheet('Plan').getRange(1, 1, 1, colonnes.length).setValues([colonnes]);
+  ctx.sandbox.SpreadsheetApp.flush();
+  const creer = ctx.sandbox.Drive.Drives.create;
+  ctx.sandbox.Drive.Drives.create = (ressource, jeton) => {
+    // Un autre onglet vient de préparer un plan : le pointeur change en pleine passe.
+    ctx.magasins.user.set('RANGEMENT_PLAN', JSON.stringify({ id: autre.getId(), url: '', cree: '2026-09-27 00:00:00' }));
+    return creer(ressource, jeton);
+  };
+  ctx.lire('rangementLancerApplication')(ctx.lire('rangementEtatPlan')().valeur.aTraiter);
+  const creation = lignesDe(feuille).find((l) => l.Action === 'Créer le Drive partagé');
+  vrai(creation['ID destination'] !== '', 'l\'identifiant du Drive est écrit dans le plan de la passe');
+  // Les lignes suivantes de la même passe doivent lire ce même plan : lues
+  // dans l'autre, elles n'y trouveraient pas le Drive et échoueraient.
+  vrai(lignesDe(feuille).filter((l) => l.Action === 'Ajouter au Drive partagé').every((l) => l['État'] === 'Fait'),
+    JSON.stringify(lignesDe(feuille).filter((l) => l.Action === 'Ajouter au Drive partagé').map((l) => l['Détail'])));
+  egal(ctx.ecritures.membresAjoutes.length, 3);
+  egal(autre.getSheetByName('Plan').getLastRow(), 1, 'rien n\'est écrit dans l\'autre plan');
+});
+
+verifier('défaut v0.2 : un déclencheur qui se réveille sans autorisation se retire lui-même', () => {
+  const { ctx } = preparerPlan();
+  ctx.sandbox.ScriptApp.newTrigger('rangementReprendreApplication').timeBased().after(60000).create();
+  egal(ctx.lire('rangementReprendreApplication')().arrete, true);
+  egal(ctx.declencheurs, [], 'un déclencheur ponctuel reste inscrit une fois exécuté : il faut le retirer');
+});
+
+verifier('défaut v0.2 : le nombre d\'échecs est le vrai nombre, pas la taille de la liste affichée', () => {
+  const { ctx, feuille } = preparerPlan({
+    modifier: (f) => { for (let i = 0; i < 60; i += 1) noteEnPlus(f, `fNoteX${i}`, `Note en plus ${i}`); },
+  });
+  ctx.fichiers.filter((f) => /^fNote/.test(f.id)).forEach((f) => { f.parents = ['dCompta']; });
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const etat = ctx.lire('rangementEtatPlan')().valeur;
+  egal(etat.nombreEchecs, 76);
+  vrai(etat.echecs.length <= 50, `${etat.echecs.length} échecs détaillés`);
+});
+
+verifier('défaut v0.2 : toute chaîne venue de Drive reste du texte dans le plan (« 2024-03-01 », « TRUE »)', () => {
+  const { feuille } = preparerPlan({
+    modifier: (f) => { noteEnPlus(f, 'fDate', '2024-03-01'); noteEnPlus(f, 'fVrai', 'TRUE'); },
+  });
+  const elements = lignesDe(feuille).map((l) => l['Élément']);
+  vrai(elements.includes('2024-03-01'), 'une date écrite en texte');
+  vrai(elements.includes('TRUE'), 'un booléen écrit en texte');
+});
+
+verifier('défaut v0.2 : une destination « Mon Drive / … » ne crée pas de dossier « Mon Drive »', () => {
+  const { ctx, feuille } = preparerPlan();
+  const ligne = lignesDe(feuille).find((l) => l['ID élément'] === 'fNote03');
+  ecrireCellule(feuille, ligne.numero, 'Destination', 'Mon Drive / Clients');
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  egal(dossierNomme(ctx, 'Mon Drive').length, 0);
+  egal(parentsDe(ctx, 'fNote03'), [dossierNomme(ctx, 'Clients', 'root00')[0].id]);
+});
+
+verifier('défaut v0.2 : l\'état du plan le lit une fois, pas une fois par dossier à déplacer à la main', () => {
+  const { ctx, classeur } = preparerPlan();
+  const plan = classeur.getSheetByName('Plan');
+  const lire = plan.getRange.bind(plan);
+  let lectures = 0;
+  plan.getRange = (l, c, h = 1, w = 1) => { if (l === 1 && h > 1) lectures += 1; return lire(l, c, h, w); };
+  ctx.lire('rangementEtatPlan')();
+  egal(lectures, 1, 'lectures complètes du plan pour un état');
+  lectures = 0;
+  ctx.lire('rangementVerifierDeplacements')();
+  vrai(lectures <= 1, `${lectures} lectures complètes du plan pour une vérification`);
+});
+
+/* --------------------------------------------------------------------------
+ * G ter. Annuler un plan (v0.3)
+ * ----------------------------------------------------------------------- */
+
+/** Un plan préparé, tout coché, appliqué jusqu'au bout. */
+const planApplique = (options) => {
+  const r = preparerPlan(options);
+  cocher(r.feuille);
+  const fin = appliquerTout(r.ctx);
+  if (!fin.ok) throw new Error(`application : ${fin.message}`);
+  return r;
+};
+
+const preparerAnnulation = (ctx) => {
+  const r = ctx.lire('rangementPreparerAnnulation')();
+  if (!r.ok) throw new Error(`annulation : ${r.message}`);
+  const classeur = ctx.sheets.classeurs.get(r.valeur.id);
+  return { annulation: r.valeur, classeur, feuille: classeur.getSheetByName('Plan') };
+};
+
+verifier('annuler : un plan inverse, rien de coché, qui devient le plan courant', () => {
+  const { ctx, prep } = planApplique();
+  const { annulation, feuille } = preparerAnnulation(ctx);
+  const pointeur = JSON.parse(ctx.magasins.user.get('RANGEMENT_PLAN'));
+  egal(pointeur.id, annulation.id);
+  egal(pointeur.annulation.id, prep.id, 'le plan inverse pointe vers le plan d\'origine');
+  const lignes = lignesDe(feuille);
+  vrai(lignes.length > 0 && lignes.every((l) => l.Action === 'Remettre en place'));
+  vrai(lignes.every((l) => l.Valider === false), 'rien de coché d\'office');
+  egal(annulation.ecartees.rattachements, 1, 'l\'orphelin rattaché ne se « remet » pas nulle part');
+  vrai(!lignes.some((l) => l['ID élément'] === 'fPerdu'));
+});
+
+verifier('annuler : chaque élément revient à son dossier d\'origine, et rien n\'est supprimé', () => {
+  const { ctx } = planApplique();
+  const dossiersAvant = ctx.fichiers.filter((f) => f.mimeType === MIME_DOSSIER).length;
+  const { feuille } = preparerAnnulation(ctx);
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  ['fNote01', 'fFormule', 'fBudget', 'dVieux'].forEach((id) => egal(parentsDe(ctx, id), ['root00'], id));
+  vrai(lignesDe(feuille).every((l) => l['État'] === 'Fait'), JSON.stringify(lignesDe(feuille).map((l) => l['Détail'])));
+  egal(ctx.fichiers.filter((f) => f.mimeType === MIME_DOSSIER).length, dossiersAvant, 'les dossiers créés restent');
+  egal(ctx.drivesPartages.length, 1, 'le Drive partagé créé n\'est pas supprimé');
+  egal(ctx.ecritures.metadonnees, []);
+});
+
+verifier('annuler : ce que l\'outil ne défait pas est listé, avec ses liens', () => {
+  const { ctx } = planApplique();
+  const { annulation, classeur } = preparerAnnulation(ctx);
+  const aDefaire = lignesDe(classeur.getSheetByName('À défaire dans Drive'));
+  egal(aDefaire.map((l) => l.Quoi), ['Drive partagé créé', 'Élément rattaché']);
+  contient(aDefaire[0].Comment, 'a@exemple.fr');
+  egal(annulation.aDefaire, 2);
+  egal(ctx.lire('rangementEtatPlan')().valeur.aDefaire.length, 2);
+});
+
+verifier('annuler : un élément déplacé depuis l\'application est laissé où il est', () => {
+  const { ctx } = planApplique();
+  const { feuille } = preparerAnnulation(ctx);
+  ctx.fichiers.find((f) => f.id === 'fNote02').parents = ['dCompta'];
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  egal(parentsDe(ctx, 'fNote02'), ['dCompta']);
+  egal(lignesDe(feuille).find((l) => l['ID élément'] === 'fNote02')['État'], 'Échec');
+});
+
+verifier('annuler : ne défait pas ce que l\'outil n\'a pas fait', () => {
+  // « Déjà à destination » au premier départ : quelqu'un l'y avait mis avant
+  // l'outil. Au deuxième départ : une tentative interrompue l'y a mis.
+  const { ctx, feuille } = planApplique();
+  const [avant, apres] = lignesDe(feuille).filter((l) => l.Action === 'Ranger').slice(0, 2);
+  ecrireCellule(feuille, avant.numero, 'Détail', 'Déjà à destination (constaté) : rien déplacé.');
+  ecrireCellule(feuille, avant.numero, 'Départs', 1);
+  ecrireCellule(feuille, apres.numero, 'Détail', 'Déjà à destination (constaté) : rien déplacé.');
+  ecrireCellule(feuille, apres.numero, 'Départs', 2);
+  const { annulation, feuille: inverse } = preparerAnnulation(ctx);
+  egal(annulation.ecartees.constatesSansDeplacement, 1);
+  const lignes = lignesDe(inverse);
+  vrai(!lignes.some((l) => l['ID élément'] === avant['ID élément']), 'pas de ligne pour l\'élément déjà en place');
+  egal(lignes.find((l) => l['ID élément'] === apres['ID élément']).Certitude, 'présomption');
+});
+
+verifier('annuler : une destination renommée depuis rend la ligne introuvable, écartée et comptée', () => {
+  const { ctx } = planApplique();
+  ctx.fichiers.find((f) => f.name === 'À trier' && (f.parents || []).includes('root00')).name = 'Tri';
+  const { annulation, feuille } = preparerAnnulation(ctx);
+  vrai(annulation.ecartees.destinationsIntrouvables >= 17, JSON.stringify(annulation.ecartees));
+  vrai(!lignesDe(feuille).some((l) => l['ID élément'] === 'fNote01'));
+  egal(dossierNomme(ctx, 'À trier').length, 0, 'la préparation ne crée aucun dossier');
+});
+
+verifier('annuler : refusé pendant une application, et quand il n\'y a rien à annuler', () => {
+  const { ctx } = planApplique();
+  ctx.magasins.user.set('RANGEMENT_APPLICATION', JSON.stringify({ plan: 'x' }));
+  const pendant = ctx.lire('rangementPreparerAnnulation')();
+  egal(pendant.ok, false);
+  contient(pendant.message, 'en cours');
+  const vierge = preparerPlan().ctx.lire('rangementPreparerAnnulation')();
+  egal(vierge.ok, false);
+  contient(vierge.message, 'rien à annuler');
+});
+
+verifier('annuler : tuée à n\'importe quel moment, l\'annulation reprend sans rien remettre deux fois', () => {
+  let points = 0;
+  for (let rang = 1; rang <= 200; rang += 1) {
+    const { ctx } = planApplique();
+    const { feuille } = preparerAnnulation(ctx);
+    cocher(feuille);
+    const avant = ctx.ecritures.deplacements.length;
+    ctx.sheets.flush.tuerAu = ctx.sheets.flush.compte + rang;
+    try { ctx.lire('rangementLancerApplication')(ctx.lire('rangementEtatPlan')().valeur.aTraiter); } catch (e) { if (e !== TUEE) throw e; }
+    ctx.sheets.flush.tuerAu = null;
+    if (!ctx.etatFaux.mort) break;
+    ctx.etatFaux.mort = false;
+    points += 1;
+    let r = ctx.lire('rangementPoursuivreApplication')();
+    for (let t = 0; r.ok && r.valeur.restant > 0 && t < 20; t += 1) r = ctx.lire('rangementPoursuivreApplication')();
+    const remis = ctx.ecritures.deplacements.slice(avant).reduce((m, d) => ({ ...m, [d.id]: (m[d.id] || 0) + 1 }), {});
+    egal(Object.entries(remis).filter(([, n]) => n > 1), [], `tuée au vidage n° ${rang}`);
+    vrai(lignesDe(feuille).every((l) => l['État'] === 'Fait'), `tuée au vidage n° ${rang}`);
+    egal(parentsDe(ctx, 'fNote01'), ['root00'], `tuée au vidage n° ${rang}`);
+  }
+  vrai(points > 20, `${points} points d'interruption seulement`);
 });
 
 verifier('le faux Drive refuse de déplacer un dossier vers un Drive partagé, comme le vrai', () => {

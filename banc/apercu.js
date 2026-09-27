@@ -134,6 +134,12 @@ const fauxServeur = `
     rangementLancerApplication: () => { PLAN.restant = 20; return { traitees: 11, restant: 20 }; },
     rangementPoursuivreApplication: () => { PLAN.restant = Math.max(0, PLAN.restant - 10); return { traitees: 10, restant: PLAN.restant }; },
     rangementArreterApplication: () => ({ arrete: true }),
+    rangementPreparerAnnulation: () => {
+      PLAN.annulation = { ...PLAN.plan };
+      PLAN.plan = { id: 'annul-demo', url: 'https://docs.google.com/spreadsheets/d/annul-demo/edit', cree: '2026-09-27 20:30:00' };
+      PLAN.restant = 25; PLAN.coche = true; PLAN.verifie = false;
+      return { ...PLAN.plan, lignes: 25, ecartees: { rattachements: 2, constatesSansDeplacement: 0, destinationsIntrouvables: 0 }, aDefaire: 2 };
+    },
     rangementVerifierDeplacements: () => { PLAN.verifie = true; return { verifies: 2, deplaces: 1 }; },
     rangementProposerIa: (resume) => ({
       principes: ['Aperçu local : proposition fictive, aucun appel n\\'est fait.'],
@@ -147,13 +153,20 @@ const fauxServeur = `
     }),
   };
   // Plan simulé : trois passages pour aller au bout, un dossier à déplacer à la main.
-  const PLAN = { plan: null, restant: 0, total: 0, coche: false, verifie: false };
+  const PLAN = { plan: null, restant: 0, total: 0, coche: false, verifie: false, annulation: null };
   const etatPlan = () => (!PLAN.plan ? { plan: null } : {
     plan: PLAN.plan, lignes: 38, validees: PLAN.coche ? 38 : 0, aTraiter: PLAN.coche ? PLAN.restant : 0,
     parAction: PLAN.coche && PLAN.restant ? { 'Créer le Drive partagé': 1, 'Ajouter au Drive partagé': 3, Ranger: 22, Archiver: 1, Regrouper: 2, Rattacher: 2 } : {},
     parEtat: PLAN.coche && PLAN.restant < 31 ? { Fait: 31 - PLAN.restant, 'À faire': 7 + PLAN.restant } : { 'À faire': 38 },
     notifications: PLAN.coche && PLAN.restant ? 3 : 0,
-    echecs: PLAN.restant === 0 && PLAN.coche ? [{ ligne: 12, action: 'Ranger', element: 'Note réunion', detail: 'L\\'élément a été déplacé depuis la préparation du plan. Laissé où il est.' }] : [],
+    nombreEchecs: PLAN.restant === 0 && PLAN.coche && !PLAN.annulation ? 1 : 0,
+    annulables: PLAN.restant === 0 && PLAN.coche ? 27 : 0,
+    annulation: PLAN.annulation,
+    aDefaire: PLAN.annulation ? [
+      { quoi: 'Drive partagé créé', element: 'Client Acme', lien: 'https://drive.google.com/drive/folders/demo', comment: 'Le supprimer se fait dans Drive, une fois vidé ; membres ajoutés par l\\'outil : paul.roux@exemple.fr.' },
+      { quoi: 'Élément rattaché', element: 'Vieux devis.pdf', lien: '', comment: 'Il n\\'avait aucun dossier : l\\'y remettre n\\'aurait pas de sens.' },
+    ] : [],
+    echecs: PLAN.restant === 0 && PLAN.coche && !PLAN.annulation ? [{ ligne: 12, action: 'Ranger', element: 'Note réunion', detail: 'L\\'élément a été déplacé depuis la préparation du plan. Laissé où il est.' }] : [],
     manuels: [{ ligne: 2, dossier: 'Marketing 2026', drive: 'Équipe Marketing', remarque: '', etat: PLAN.verifie ? 'Fait (constaté)' : 'À faire', verifie: PLAN.verifie ? '2026-09-27 20:15:00' : '', idDossier: 'demo1', idDrive: 'dp-marketing' },
       { ligne: 3, dossier: 'Client Acme', drive: 'Client Acme', remarque: '35 éléments appartiennent à des personnes extérieures : Google refusera le déplacement.', etat: 'À faire', verifie: '', idDossier: 'demo2', idDrive: '' }],
     enCours: null,

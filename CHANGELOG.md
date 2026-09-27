@@ -3,6 +3,26 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/).
 Ce projet suit le [Semantic Versioning](https://semver.org/lang/fr/).
 
+## [0.3.0] - 2026-09-27
+
+Annuler un plan, et les défauts trouvés en relisant la v0.2.
+
+### Ajouté
+
+- **Annuler un plan** (onglet Application) : un plan inverse, qui devient le plan courant, à relire, cocher et appliquer comme tout plan. Chaque élément rangé, archivé ou regroupé revient dans son dossier d'origine ; le plan d'origine reste intact et le plan inverse pointe vers lui.
+- Onglet *À défaire dans Drive* : Drives partagés créés et membres ajoutés, dossiers déplacés vers un Drive partagé, éléments rattachés — ce que l'outil ne défait pas, avec les liens pour le faire.
+- Action « Remettre en place » ; un plan d'annulation s'annule lui-même (refaire le rangement).
+
+### Corrigé
+
+- **Préparer un plan pendant qu'une application tournait** faisait lire aux lignes suivantes de la passe le *nouveau* plan : un membre à ajouter n'y trouvait pas son Drive et échouait. La préparation prend désormais le verrou de la personne, et chaque exécution garde le classeur avec lequel elle a commencé.
+- **Déclencheur orphelin** : réveillé après un arrêt ou un changement de plan, le déclencheur de reprise rendait la main sans se retirer ; un déclencheur ponctuel restant inscrit une fois exécuté, ils s'accumulaient vers la limite de vingt.
+- **Nombre d'échecs faux** : la liste affichée étant tronquée à 50, l'écran annonçait « 50 lignes en échec » pour 300. Le vrai nombre est désormais affiché, et la liste dit qu'elle n'en détaille qu'une partie.
+- **Texte forcé partout** dans le plan, et non plus seulement pour `=`, `+`, `-`, `@` : un dossier nommé « 2024-03-01 » devenait une date, « TRUE » un booléen.
+- Une destination corrigée en « Mon Drive / Compta » créait un dossier nommé « Mon Drive ».
+- L'état du plan et la vérification des déplacements manuels relisaient le plan entier pour chaque dossier concerné ; une seule lecture désormais.
+- L'accueil ne réapparaît plus si la réponse du démarrage arrive après un premier clic.
+
 ## [0.2.0] - 2026-09-27
 
 Le rangement : plan puis application.

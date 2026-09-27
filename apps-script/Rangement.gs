@@ -25,7 +25,7 @@
  */
 
 /** Seule source du numéro de version ; le banc vérifie qu'il vaut VERSION. */
-const RANGEMENT_VERSION_ = '0.2.0';
+const RANGEMENT_VERSION_ = '0.3.0';
 
 function doGet() {
   return SocleWeb.page({
@@ -84,6 +84,7 @@ function rangementProposerIa(resume) {
 
 /** Écrit le plan de rangement dans un nouveau classeur. Rien n'est coché, rien n'est fait. */
 function rangementPreparerPlan(proposition) {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementPreparerPlan', () => {
     SocleErreurs.oublier();
     return rangementPreparer_(proposition);
@@ -92,26 +93,40 @@ function rangementPreparerPlan(proposition) {
 
 /** Le décompte exact de ce que l'application ferait maintenant. */
 function rangementEtatPlan() {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementEtatPlan', () => rangementEtat_());
 }
 
 /** Lance l'application, si le nombre confirmé vaut toujours le nombre réel. */
 function rangementLancerApplication(confirme) {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementLancerApplication', () => rangementLancer_(confirme));
 }
 
 /** Un passage de plus, tant que le navigateur reste ouvert. */
 function rangementPoursuivreApplication() {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementPoursuivreApplication',
     () => rangementPoursuivre_(RANGEMENT_BUDGET_NAVIGATEUR_MS_));
 }
 
 function rangementArreterApplication() {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementArreterApplication', () => rangementArreter_());
+}
+
+/** Prépare le plan inverse du plan courant. Rien n'est coché, rien n'est fait. */
+function rangementPreparerAnnulation() {
+  rangementNouvelleExecution_();
+  return SocleWeb.frontiere('rangementPreparerAnnulation', () => {
+    SocleErreurs.oublier();
+    return rangementPreparerAnnulation_();
+  });
 }
 
 /** Constate, dans Drive, les déplacements vers les Drives partagés faits à la main. */
 function rangementVerifierDeplacements() {
+  rangementNouvelleExecution_();
   return SocleWeb.frontiere('rangementVerifierDeplacements', () => {
     SocleErreurs.oublier();
     return rangementVerifierManuels_();
@@ -125,6 +140,7 @@ function rangementVerifierDeplacements() {
  * dont c'est le plan, et personne d'autre.
  */
 function rangementReprendreApplication() {
+  rangementNouvelleExecution_();
   return rangementPoursuivre_(RANGEMENT_BUDGET_ARRIERE_PLAN_MS_, true);
 }
 

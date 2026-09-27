@@ -30,6 +30,7 @@
     plan: {
       preparation: false, prepare: null, erreur: '', etat: null,
       application: { enCours: false, arret: false, confirmation: false, bilan: null, message: '', verification: false },
+      annulation: { preparation: false, resultat: null, erreur: '' },
     },
   };
 
@@ -117,7 +118,11 @@
           `Un plan de rangement préparé le ${dateLisible(c.plan.cree)} vous attend. `,
           el('button', { classe: 's-bouton s-bouton--discret', onclick: () => ouvrirOnglet('application') }, 'Ouvrir l\'application du plan')));
       }
-      montrer('ecran-accueil', true);
+      // L'accueil ne s'affiche que si rien d'autre ne l'a déjà remplacé :
+      // la réponse du serveur peut arriver après un premier clic.
+      if ($('ecran-balayage').classList.contains('r-cache') && $('ecran-rapport').classList.contains('r-cache')) {
+        montrer('ecran-accueil', true);
+      }
     } catch (erreur) {
       remplacer($('erreur-generale'), bandeau('critique',
         el('strong', null, 'L\'outil n\'a pas pu démarrer. '), erreurLisible(erreur),
@@ -514,6 +519,8 @@
     ouvrirOnglet('hierarchie');
     try {
       etat.plan.prepare = await socle.demander('rangementPreparerPlan', [RangementAnalyse.propositionDePlan(etat.rapport)]);
+      Object.assign(etat.plan.application, { message: '', bilan: null, confirmation: false });
+      etat.plan.annulation.resultat = null;
       etat.contexte.plan = { id: etat.plan.prepare.id, url: etat.plan.prepare.url, cree: etat.plan.prepare.cree };
     } catch (erreur) {
       etat.plan.erreur = erreurLisible(erreur);
@@ -558,8 +565,13 @@
     const blocs = [
       carte(
         el('div', { classe: 'r-entete' },
-          el('h2', { classe: 's-sous-titre' }, `Plan du ${dateLisible(e.plan.cree)}`),
+          el('h2', { classe: 's-sous-titre' }, e.annulation
+            ? `Annulation du plan du ${dateLisible(e.annulation.cree)}` : `Plan du ${dateLisible(e.plan.cree)}`),
           el('a', { href: e.plan.url, target: '_blank', rel: 'noopener' }, 'Ouvrir le plan dans Sheets')),
+        e.annulation ? el('p', { classe: 's-legende' }, 'Ce plan remet en place ce que le ',
+          el('a', { href: e.annulation.url, target: '_blank', rel: 'noopener' }, 'plan d\'origine'),
+          ' a rangé. Il se relit, se coche et s\'applique comme tout plan.') : null,
+        annulationPreparee(),
         el('div', { classe: 's-grille' },
           chiffre(nombre(e.lignes), 'lignes dans le plan', 'onglet « Plan » du classeur'),
           chiffre(nombre(e.validees), 'lignes cochées', 'colonne « Valider »'),
@@ -595,8 +607,8 @@
           el('tbody', null, actions.map(([action, n]) => el('tr', null, el('td', null, action), el('td', { classe: 's-nombre' }, nombre(n))))))),
         e.notifications ? bandeau('avertissement', `${pluriel(e.notifications, 'personne sera ajoutée', 'personnes seront ajoutées')} à un Drive partagé : `
           + 'Google leur enverra une notification par courriel.') : null,
-        el('p', { classe: 's-legende' }, 'Réversible : un déplacement dans Mon Drive se défait dans Drive, et le plan garde l\'emplacement d\'origine de chaque élément. '
-          + 'Un Drive partagé créé se supprime depuis Drive, une fois vidé.'),
+        el('p', { classe: 's-legende' }, 'Réversible : une fois appliqué, ce plan s\'annule par un plan inverse (« Annuler ce plan »), '
+          + 'qui remet chaque élément dans son dossier d\'origine. Un Drive partagé créé, lui, se supprime depuis Drive, une fois vidé.'),
         el('label', { classe: 's-rangee' },
           el('input', { type: 'checkbox', checked: a.confirmation, onchange: (ev) => { a.confirmation = ev.target.checked; rendreApplication(); } }),
           `J'ai relu le plan : appliquer les ${pluriel(e.aTraiter, 'ligne cochée', 'lignes cochées')}.`),
@@ -616,9 +628,11 @@
           e.validees > 0 ? el('button', { classe: 's-bouton s-bouton--primaire', onclick: commencer }, 'Relancer l\'analyse') : null)));
     }
 
-    if (e.echecs.length) {
+    if (e.nombreEchecs) {
       blocs.push(carte(
-        el('h2', { classe: 's-sous-titre' }, `${pluriel(e.echecs.length, 'ligne en échec', 'lignes en échec')}`),
+        el('h2', { classe: 's-sous-titre' }, `${pluriel(e.nombreEchecs, 'ligne en échec', 'lignes en échec')}`),
+        e.nombreEchecs > e.echecs.length ? el('p', { classe: 's-legende' },
+          `Les ${e.echecs.length} premières sont détaillées ici ; toutes le sont dans la colonne Détail du plan.`) : null,
         el('p', { classe: 's-legende' }, 'Rien n\'a été fait pour ces lignes. Corrigez si besoin, remettez « À faire » dans la colonne État, cochez, et relancez.'),
         el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
           el('thead', null, el('tr', null, ['Ligne', 'Action', 'Élément', 'Pourquoi'].map((t) => el('th', null, t)))),
@@ -647,7 +661,66 @@
           classe: 's-bouton', disabled: a.verification, onclick: verifierManuels,
         }, a.verification ? 'Vérification…' : 'Vérifier les déplacements')));
     }
+    if (!a.enCours && !e.enCours && e.annulables > 0) blocs.push(carteAnnulation(e));
+    if (e.aDefaire.length) blocs.push(carteADefaire(e));
     return blocs;
+  };
+
+  /* ---- annulation (v0.3) ---- */
+
+  const annulationPreparee = () => {
+    const x = etat.plan.annulation;
+    if (x.erreur) return bandeau('critique', x.erreur);
+    if (!x.resultat) return null;
+    const r = x.resultat;
+    const ecarts = [
+      r.ecartees.rattachements ? pluriel(r.ecartees.rattachements, 'élément rattaché', 'éléments rattachés') : '',
+      r.ecartees.constatesSansDeplacement ? pluriel(r.ecartees.constatesSansDeplacement, 'élément que l\'outil avait trouvé déjà en place',
+        'éléments que l\'outil avait trouvés déjà en place') : '',
+      r.ecartees.destinationsIntrouvables ? pluriel(r.ecartees.destinationsIntrouvables, 'élément dont le dossier de rangement a été renommé ou supprimé',
+        'éléments dont le dossier de rangement a été renommé ou supprimé') : '',
+    ].filter((t) => t !== '');
+    return bandeau('bon', `Plan d'annulation écrit : ${pluriel(r.lignes, 'ligne', 'lignes')} à relire. `,
+      el('a', { href: r.url, target: '_blank', rel: 'noopener' }, 'Ouvrez-le dans Sheets'),
+      ', cochez ce que vous voulez remettre en place, puis appliquez ici.',
+      ecarts.length ? ` Écartés, et pourquoi : ${ecarts.join(' ; ')}.` : '');
+  };
+
+  const carteAnnulation = (e) => carte(
+    el('h2', { classe: 's-sous-titre' }, e.annulation ? 'Refaire le rangement' : 'Annuler ce plan'),
+    el('p', null, 'Remet chaque élément rangé par ce plan dans le dossier où il était. L\'annulation est elle-même un plan : '
+      + 'un nouveau classeur, à relire et cocher, puis à appliquer ici. Rien ne bouge avant.'),
+    el('p', { classe: 's-legende' }, `Jusqu'à ${pluriel(e.annulables, 'élément', 'éléments')} à remettre en place. Ne sont pas défaits : `
+      + 'les Drives partagés créés et leurs membres (les défaire, c\'est supprimer, ce que l\'outil ne fait jamais), les dossiers '
+      + 'déplacés vers un Drive partagé, les éléments rattachés. Ils seront listés, avec leurs liens.'),
+    el('button', {
+      classe: 's-bouton', disabled: etat.plan.annulation.preparation, onclick: preparerAnnulation,
+    }, etat.plan.annulation.preparation ? 'Écriture du plan d\'annulation…' : 'Préparer l\'annulation'));
+
+  const carteADefaire = (e) => carte(
+    el('h2', { classe: 's-sous-titre' }, 'À défaire vous-même dans Drive'),
+    el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+      el('thead', null, el('tr', null, ['Quoi', 'Élément', 'Comment'].map((t) => el('th', null, t)))),
+      el('tbody', null, e.aDefaire.map((x) => el('tr', null,
+        el('td', null, x.quoi),
+        el('td', null, x.lien ? el('a', { href: x.lien, target: '_blank', rel: 'noopener' }, x.element) : x.element),
+        el('td', { classe: 's-legende' }, x.comment)))))));
+
+  const preparerAnnulation = async () => {
+    if (!window.confirm('Le plan d\'annulation deviendra le plan courant ; celui-ci reste dans votre Drive, intact. Continuer ?')) return;
+    const x = etat.plan.annulation;
+    Object.assign(x, { preparation: true, erreur: '', resultat: null });
+    // Un nouveau plan : ce que disait l'application du précédent ne vaut plus.
+    Object.assign(etat.plan.application, { message: '', bilan: null, confirmation: false });
+    rendreApplication();
+    try {
+      x.resultat = await socle.demander('rangementPreparerAnnulation');
+      etat.contexte.plan = { id: x.resultat.id, url: x.resultat.url, cree: x.resultat.cree };
+    } catch (erreur) {
+      x.erreur = erreurLisible(erreur);
+    }
+    x.preparation = false;
+    await chargerEtatPlan();
   };
 
   /**
@@ -658,6 +731,7 @@
   const executer = async (confirme) => {
     const a = etat.plan.application;
     Object.assign(a, { enCours: true, arret: false, message: '', confirme: confirme || (etat.plan.etat && etat.plan.etat.aTraiter) });
+    etat.plan.annulation.resultat = null;
     rendreApplication();
     try {
       let r = confirme !== undefined
@@ -898,6 +972,8 @@
             + 'et après confirmation du nombre exact de lignes.'),
           el('li', null, 'L\'outil déplace, crée des dossiers, crée des Drives partagés et y ajoute des membres. Jamais de suppression, de mise à la corbeille ni de renommage.'),
           el('li', null, 'Avant chaque action, il relit l\'état réel : un élément déplacé depuis la préparation du plan est laissé où il est.'),
+          el('li', null, 'Un plan appliqué s\'annule par un plan inverse, lui aussi relu et coché : chaque élément revient dans son dossier d\'origine. '
+            + 'Les Drives partagés créés, leurs membres et les dossiers déplacés vers un Drive partagé se défont à la main : l\'outil les liste.'),
           el('li', null, 'L\'analyse tourne dans votre navigateur. Rien n\'est conservé après la fermeture de la page, sauf vos réglages.'),
           el('li', null, 'Les éléments partagés avec vous mais hors de votre arborescence sont lus puis mis de côté : ce n\'est pas à vous de les ranger.'))),
       carte(el('h2', { classe: 's-sous-titre' }, 'Le score « Drive partagé »'),

@@ -78,6 +78,24 @@ Le banc tue l'exécution à **chaque** vidage d'écriture possible, puis la repr
 élément n'est jamais déplacé deux fois, aucun Drive créé deux fois, aucun membre ajouté
 deux fois, et toutes les lignes finissent « Fait ».
 
+## Annuler un plan
+
+Un plan appliqué s'annule par un **plan inverse** : un nouveau classeur, qui devient le plan
+courant, à relire, cocher et appliquer comme tout plan. Le plan d'origine reste intact.
+
+| Ce qui est remis en place | Ce qui ne l'est pas, et pourquoi |
+|---|---|
+| Chaque élément rangé, archivé ou regroupé par l'outil revient dans son dossier d'origine, que le plan avait gardé. | Un **Drive partagé créé** et ses **membres** : les défaire, c'est supprimer, ce que l'outil ne fait jamais. Listés dans l'onglet *À défaire dans Drive*, avec leurs liens. |
+| Un élément trouvé « déjà à destination » après une tentative interrompue : très probablement déplacé par l'outil, remis en place avec la mention « présomption ». | Un élément trouvé déjà à destination au premier essai : quelqu'un l'y avait mis, l'outil ne défait pas ce qu'il n'a pas fait. |
+| | Un élément **rattaché** : il n'avait aucun dossier, l'y remettre n'aurait pas de sens. |
+| | Un dossier déplacé à la main vers un Drive partagé : sa propriété est passée à l'organisation, le retour se fait dans Drive. |
+
+| Choix | Pourquoi |
+|---|---|
+| L'annulation est un plan | Mêmes garde-fous que le rangement : relecture, cases à cocher, décompte confirmé, état relu avant chaque action, reprise sans doublon. |
+| Emplacement actuel retrouvé **sans rien créer** | Préparer une annulation ne touche pas à Drive ; un dossier de rangement renommé depuis rend la ligne introuvable, écartée et comptée. |
+| Les dossiers créés par le rangement restent | Vides après l'annulation, ils seront signalés à la prochaine analyse ; les supprimer serait une suppression. |
+
 ## Choix de conception
 
 | Choix | Pourquoi |
@@ -134,7 +152,7 @@ Toutes ces compensations se vérifient d'un `grep`, et `node banc/test.js` les v
 | `RangementDrive.gs` | Lecture de Drive, traduction en enregistrements compacts. |
 | `RangementReglages.gs` | Valeurs par défaut, bornes, lecture et écriture des réglages. |
 | `RangementIa.gs` | Appel à Gemini, validation de l'envoi et de la réponse, quota. |
-| `RangementPlan.gs` | Le plan : préparation, application ligne à ligne, vérification des déplacements manuels. Seul fichier qui écrit dans Drive. |
+| `RangementPlan.gs` | Le plan : préparation, application ligne à ligne, vérification des déplacements manuels, annulation. Seul fichier qui écrit dans Drive. |
 | `PlanPuisApplication.gs` | Le motif, recopié de `plan-puis-application` 0.1.1 avec deux points d'injection (classeur, verrou). |
 | `RangementAnalyse.html` | L'analyse, en fonctions pures — le banc l'exécute dans Node. |
 | `RangementClient.html`, `Index.html` | L'interface. |
@@ -163,7 +181,7 @@ Produit `banc/apercu.html` : l'interface complète sur un Drive fictif, à ouvri
 - Les doublons se devinent au nom et à la taille, sans lire le contenu : présomption.
 - Le rapprochement « fichier de la racine → dossier » ne regarde que les mots des noms.
 - Déplacer un dossier vers un Drive partagé reste manuel : l'API ne le permet pas.
-- Pas d'annulation automatique : le plan garde l'emplacement d'origine de chaque élément, et un déplacement dans Mon Drive se défait dans Drive.
+- L'annulation ne supprime rien : Drives partagés créés, membres ajoutés et dossiers créés se défont à la main.
 - L'interface est en français.
 
 Développé par [Fabrice Faucheux](https://faucheux.bzh) — Dépôt : [github.com/FabriceFx/drive-organizer-gas](https://github.com/FabriceFx/drive-organizer-gas)  
@@ -184,6 +202,7 @@ ever deleted; file contents are never read.
 
 - Web app running as the accessing user. Scopes: `drive` (moving requires it; no delete, trash or permission removal anywhere in the code, checked by the test bench), `spreadsheets` (the plan), `script.scriptapp` (background resume), `script.external_request` (optional AI only).
 - Plan then apply: exact count confirmed before applying; each line re-reads the real state first; resumable after being killed at any point without doing anything twice. Moving a folder into a shared drive stays manual (the API refuses it); the tool links to it and verifies it.
+- Undo: an applied plan is reversed by an inverse plan, reviewed and ticked like any plan; created shared drives and their members are listed, never deleted.
 - Browser-driven scan (one page per call, far from the 6-minute cap); analysis runs in the browser.
 - Every score shows its breakdown; facts and presumptions are kept apart; "not measured" is never counted as zero.
 - Optional AI (Gemini 3.8 Flash, paid-tier key required): only folder paths and counters are sent, after explicit consent; the response is validated; 5 requests per user per day.

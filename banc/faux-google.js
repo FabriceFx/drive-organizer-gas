@@ -95,7 +95,7 @@ const TUEE = new Error('Exécution tuée (simulée par le banc)');
  *   - « 'texte » : l'apostrophe force le texte, et disparaît de la valeur ;
  *   - « =… » : devient une formule — le banc la consigne, pour vérifier
  *     qu'aucun nom de fichier n'en devient une ;
- *   - un nombre écrit en texte redevient un nombre ;
+ *   - un nombre écrit en texte redevient un nombre, « TRUE » un booléen ;
  *   - « 2026-09-27 » ou « 2026-09-27 10:00:00 » devient un objet Date.
  */
 const fabriquerCoercion = (etatFaux) => (valeur) => {
@@ -103,6 +103,7 @@ const fabriquerCoercion = (etatFaux) => (valeur) => {
   if (valeur.startsWith("'")) return valeur.slice(1);
   if (valeur.startsWith('=')) { etatFaux.formules.push(valeur); return valeur; }
   if (/^-?\d+(\.\d+)?$/.test(valeur)) return Number(valeur);
+  if (/^(true|false)$/i.test(valeur)) return /^true$/i.test(valeur);
   const date = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2})(?::(\d{2}))?)?$/.exec(valeur);
   if (date) {
     const [, a, m, j, h = '0', mi = '0', se = '0'] = date;
@@ -282,7 +283,10 @@ const construireSandbox = (options = {}) => {
     },
     Files: {
       get: (id, params) => {
-        if (id === 'root') return { id: racineId };
+        if (id === 'root' || id === racineId) {
+          return restreindre({ id: racineId, mimeType: MIME_DOSSIER, trashed: false },
+            (params && params.fields ? params.fields : 'id').split(','));
+        }
         const f = trouver(id, params);
         return restreindre(f, (params && params.fields ? params.fields : 'id').split(','));
       },

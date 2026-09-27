@@ -49,14 +49,27 @@ const RANGEMENT_ACTIONS_ = {
   archiver: 'Archiver',
   regrouper: 'Regrouper',
   rattacher: 'Rattacher',
+  remettre: 'Remettre en place',
   creerDrive: 'Créer le Drive partagé',
   ajouterMembre: 'Ajouter au Drive partagé',
 };
 
 const RANGEMENT_ACTIONS_DEPLACEMENT_ = [
   RANGEMENT_ACTIONS_.ranger, RANGEMENT_ACTIONS_.archiver,
-  RANGEMENT_ACTIONS_.regrouper, RANGEMENT_ACTIONS_.rattacher,
+  RANGEMENT_ACTIONS_.regrouper, RANGEMENT_ACTIONS_.rattacher, RANGEMENT_ACTIONS_.remettre,
 ];
+
+/**
+ * Les déplacements qu'une annulation sait défaire. « Rattacher » n'y est pas :
+ * l'élément était rangé nulle part, et l'y remettre n'a pas de sens.
+ */
+const RANGEMENT_ACTIONS_ANNULABLES_ = [
+  RANGEMENT_ACTIONS_.ranger, RANGEMENT_ACTIONS_.archiver,
+  RANGEMENT_ACTIONS_.regrouper, RANGEMENT_ACTIONS_.remettre,
+];
+
+const RANGEMENT_ONGLET_A_DEFAIRE_ = 'À défaire dans Drive';
+const RANGEMENT_COLONNES_A_DEFAIRE_ = ['Quoi', 'Élément', 'Lien', 'Comment'];
 
 /**
  * Rôles qu'un plan peut attribuer dans un Drive partagé. « Gestionnaire »
@@ -89,6 +102,7 @@ const RANGEMENT_COLONNES_MANUEL_ = [
 ];
 
 const RANGEMENT_PLAN_LIGNES_MAX_ = 20000;
+const RANGEMENT_ECHECS_DETAILLES_ = 50;
 const RANGEMENT_MIME_TABLEUR_ = 'application/vnd.google-apps.spreadsheet';
 
 /**
@@ -99,22 +113,49 @@ const RANGEMENT_BUDGET_NAVIGATEUR_MS_ = 40 * 1000;
 const RANGEMENT_BUDGET_ARRIERE_PLAN_MS_ = 4 * 60 * 1000;
 const RANGEMENT_DUREE_UNITE_MS_ = 15 * 1000;
 
-/** État d'une exécution : lignes à écrire, dossiers déjà résolus. Objet `const` muté en place. */
-const RANGEMENT_PLAN_MEMOIRE_ = { lignes: [], dossiers: {}, destinations: {}, racine: '', operations: {} };
+/**
+ * Mémoire **d'une exécution** : le classeur du plan, les dossiers déjà
+ * résolus, les Drives créés. Objet `const` muté en place.
+ *
+ * Le classeur est figé pour toute l'exécution : si un autre onglet prépare un
+ * nouveau plan pendant qu'une passe tourne, la passe doit finir sur **son**
+ * plan. Relire le pointeur à chaque ligne faisait lire aux lignes suivantes
+ * un autre plan que le leur (défaut de la v0.2).
+ */
+const RANGEMENT_PLAN_MEMOIRE_ = {
+  lignes: [], classeur: null, dossiers: {}, destinations: {}, drivesParCle: null, racine: '', operations: {},
+};
+
+/**
+ * Oublie la mémoire d'exécution. Apps Script repart de zéro à chaque appel ;
+ * chaque point d'entrée l'appelle quand même, pour que le banc — qui enchaîne
+ * les appels dans un même contexte — se comporte comme Google.
+ */
+const rangementNouvelleExecution_ = () => {
+  Object.assign(RANGEMENT_PLAN_MEMOIRE_, {
+    lignes: [], classeur: null, dossiers: {}, destinations: {}, drivesParCle: null, racine: '',
+  });
+};
 
 /* ------------------------------------------------------------ outils */
 
 const rangementTexteBrut_ = (valeur) => String(valeur ?? '').trim();
 
 /**
- * Une valeur qui commence par =, +, - ou @ deviendrait une formule dans
- * Sheets. Un nom de fichier « =IMPORTXML(…) » s'exécuterait alors dans le plan
- * de la personne. L'apostrophe initiale force le texte, et Sheets ne
- * l'affiche pas.
+ * Force une chaîne à rester du texte dans le plan.
+ *
+ * `setValues` interprète ce qu'on lui donne comme une saisie : « =… » devient
+ * une formule — un nom de fichier « =IMPORTXML(…) » s'exécuterait dans le plan
+ * —, « 2024-03-01 » une date, « TRUE » un booléen. L'apostrophe initiale force
+ * le texte et n'apparaît pas à la lecture. On l'applique à **toute** chaîne
+ * venue de Drive, comme metrique-usage, sans chercher à reconnaître les
+ * dangereuses : une liste de caractères interdits s'oublie, pas une règle. La
+ * v0.2 ne traitait que = + - @, et un dossier nommé « 2024-03 » changeait de
+ * nature dans le plan.
  */
 const rangementEnTexte_ = (valeur) => {
   const texte = String(valeur ?? '');
-  return /^[=+\-@]/.test(texte) ? `'${texte}` : texte;
+  return texte === '' ? '' : `'${texte}`;
 };
 
 const rangementUrlDrive_ = (id, dossier) => (dossier
@@ -130,6 +171,7 @@ const rangementPlanCourant_ = () => {
 };
 
 const rangementClasseurPlan_ = () => {
+  if (RANGEMENT_PLAN_MEMOIRE_.classeur) return RANGEMENT_PLAN_MEMOIRE_.classeur;
   const plan = rangementPlanCourant_();
   if (!plan) {
     throw SocleErreurs.erreur({
@@ -138,7 +180,8 @@ const rangementClasseurPlan_ = () => {
     });
   }
   try {
-    return SpreadsheetApp.openById(plan.id);
+    RANGEMENT_PLAN_MEMOIRE_.classeur = SpreadsheetApp.openById(plan.id);
+    return RANGEMENT_PLAN_MEMOIRE_.classeur;
   } catch (e) {
     throw SocleErreurs.erreur({
       quoi: 'Le classeur du plan est introuvable : il a peut-être été supprimé.',
@@ -282,8 +325,6 @@ const rangementLignesPlan_ = ({ mouvements, drives }) => {
 };
 
 const RANGEMENT_MODE_EMPLOI_ = [
-  ['Plan de rangement — mode d\'emploi'],
-  [''],
   ['1. Relisez l\'onglet « Plan ». Rien n\'est encore fait.'],
   ['2. Cochez « Valider » sur chaque ligne que vous approuvez. Une ligne non cochée ne sera jamais traitée.'],
   ['   Astuce : sélectionnez plusieurs cases puis appuyez sur Espace pour les cocher d\'un coup.'],
@@ -299,8 +340,28 @@ const RANGEMENT_MODE_EMPLOI_ = [
   ['Avant d\'agir, l\'outil relit l\'état réel : un élément déplacé depuis la préparation est laissé où il est,'],
   ['un élément déjà à destination est constaté, jamais déplacé deux fois. Rien n\'est supprimé ni mis à la corbeille.'],
   [''],
+];
+
+const RANGEMENT_MODE_EMPLOI_RANGEMENT_ = [
+  ['Plan de rangement — mode d\'emploi'],
+  [''],
+  ...RANGEMENT_MODE_EMPLOI_,
+  [''],
   ['L\'onglet « À déplacer dans Drive » liste les dossiers à faire glisser vous-même vers un Drive partagé :'],
   ['Google ne permet pas de le faire par programme, et son interface garde les liens intacts.'],
+];
+
+const RANGEMENT_MODE_EMPLOI_ANNULATION_ = [
+  ['Annulation d\'un plan de rangement — mode d\'emploi'],
+  [''],
+  ['Ce plan remet chaque élément rangé par le plan d\'origine dans le dossier où il était avant.'],
+  ['C\'est un plan comme un autre : rien n\'est fait tant que vous n\'avez pas coché les lignes.'],
+  [''],
+  ...RANGEMENT_MODE_EMPLOI_,
+  [''],
+  ['Ce que l\'outil ne défait pas, et pourquoi, est listé dans l\'onglet « À défaire dans Drive » :'],
+  ['les Drives partagés créés et leurs membres (les défaire, c\'est supprimer, ce que l\'outil ne fait jamais),'],
+  ['les dossiers que vous avez déplacés vers un Drive partagé, et les éléments rattachés qui n\'avaient pas de dossier.'],
 ];
 
 /** Range le classeur du plan dans un dossier dédié plutôt qu'à la racine qu'on veut désencombrer. */
@@ -319,48 +380,86 @@ const rangementRangerClasseur_ = (idClasseur) => {
   }));
 };
 
-const rangementPreparer_ = (proposition) => {
-  const propre = rangementValiderProposition_(proposition);
+/**
+ * Exécute `operation` sous le verrou de la personne, ou refuse. Une passe
+ * d'application tient ce verrou : préparer un plan pendant qu'elle tourne
+ * changerait le plan sous ses pieds.
+ */
+const rangementSousVerrou_ = (operation) => {
+  const verrou = LockService.getUserLock();
+  if (!verrou.tryLock(0)) {
+    throw SocleErreurs.erreur({
+      quoi: 'Une application de plan est en cours (dans un autre onglet, ou en arrière-plan).',
+      quoiFaire: 'Attendez qu\'elle se termine, ou arrêtez-la depuis l\'onglet Application, puis réessayez.',
+    });
+  }
+  try {
+    return operation();
+  } finally {
+    verrou.releaseLock();
+  }
+};
+
+/**
+ * Crée un classeur de plan, en fait le plan courant et y écrit les lignes.
+ * Commun au plan de rangement et à son annulation : un plan inverse passe par
+ * exactement le même chemin qu'un plan, donc par les mêmes garde-fous.
+ */
+const rangementEcrireClasseur_ = ({ nom, modeEmploi, lignes, pointeur = {} }) => {
   const horodatage = SocleDates.maintenantHorodatage();
   const titre = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
-  const classeur = SpreadsheetApp.create(`Plan de rangement Drive — ${titre}`);
+  const classeur = SpreadsheetApp.create(`${nom} — ${titre}`);
   const id = classeur.getId();
+  RANGEMENT_PLAN_MEMOIRE_.classeur = classeur;
+  RANGEMENT_PLAN_MEMOIRE_.drivesParCle = null;
 
   // Le pointeur est posé tout de suite : un plan à moitié écrit se retrouve,
   // il ne devient pas un fichier orphelin que personne ne rouvrira.
   PropertiesService.getUserProperties().setProperty(RANGEMENT_PROPRIETE_PLAN_,
-    JSON.stringify({ id, url: classeur.getUrl(), cree: horodatage }));
+    JSON.stringify({ id, url: classeur.getUrl(), cree: horodatage, ...pointeur }));
   // Un nouveau plan remplace l'ancien : une application encore en cours sur
   // l'ancien s'arrête, déclencheur compris.
   rangementArreter_();
 
   const aide = classeur.getSheets()[0];
   aide.setName(RANGEMENT_ONGLET_AIDE_);
-  aide.getRange(1, 1, RANGEMENT_MODE_EMPLOI_.length, 1).setValues(RANGEMENT_MODE_EMPLOI_);
+  aide.getRange(1, 1, modeEmploi.length, 1).setValues(modeEmploi);
   aide.getRange(1, 1).setFontWeight('bold');
 
-  RANGEMENT_PLAN_MEMOIRE_.lignes = rangementLignesPlan_(propre);
-  const operation = rangementOperation_(RANGEMENT_BUDGET_NAVIGATEUR_MS_);
-  const prepare = operation.preparer();
+  RANGEMENT_PLAN_MEMOIRE_.lignes = lignes;
+  const prepare = rangementOperation_(RANGEMENT_BUDGET_NAVIGATEUR_MS_).preparer();
 
   const lu = rangementLireOnglet_(classeur, RANGEMENT_ONGLET_PLAN_);
-  RANGEMENT_COLONNES_MASQUEES_.forEach((titre) => lu.feuille.hideColumns(lu.index[titre] + 1));
+  RANGEMENT_COLONNES_MASQUEES_.forEach((colonne) => lu.feuille.hideColumns(lu.index[colonne] + 1));
+  return { classeur, id, horodatage, lignes: prepare.lignes };
+};
 
-  const manuel = classeur.insertSheet(RANGEMENT_ONGLET_MANUEL_);
+/** Un onglet d'en-tête `colonnes`, rempli de `corps`, colonnes `masquees` cachées. */
+const rangementEcrireOnglet_ = (classeur, nom, colonnes, corps, masquees = []) => {
+  const feuille = classeur.insertSheet(nom);
+  feuille.getRange(1, 1, 1, colonnes.length).setValues([colonnes]).setFontWeight('bold');
+  if (corps.length > 0) feuille.getRange(2, 1, corps.length, colonnes.length).setValues(corps);
+  feuille.setFrozenRows(1);
+  masquees.forEach((titre) => feuille.hideColumns(colonnes.indexOf(titre) + 1));
+  return feuille;
+};
+
+const rangementPreparer_ = (proposition) => rangementSousVerrou_(() => {
+  const propre = rangementValiderProposition_(proposition);
+  const { classeur, id, horodatage, lignes } = rangementEcrireClasseur_({
+    nom: 'Plan de rangement Drive',
+    modeEmploi: RANGEMENT_MODE_EMPLOI_RANGEMENT_,
+    lignes: rangementLignesPlan_(propre),
+  });
+
   const corpsManuel = propre.manuels.map((m) => [
     rangementEnTexte_(m.nom), rangementEnTexte_(m.chemin), rangementEnTexte_(m.drive),
     rangementEnTexte_(m.remarque || ''), rangementUrlDrive_(m.id, true),
     m.driveId ? rangementUrlDrive_(m.driveId, true) : 'après création du Drive partagé',
     'À faire', '', m.id, m.driveId || '', m.cleDrive || '',
   ]);
-  manuel.getRange(1, 1, 1, RANGEMENT_COLONNES_MANUEL_.length).setValues([RANGEMENT_COLONNES_MANUEL_]).setFontWeight('bold');
-  if (corpsManuel.length > 0) {
-    manuel.getRange(2, 1, corpsManuel.length, RANGEMENT_COLONNES_MANUEL_.length).setValues(corpsManuel);
-  }
-  manuel.setFrozenRows(1);
-  ['ID dossier', 'ID Drive', 'Clé Drive'].forEach((titre) => {
-    manuel.hideColumns(RANGEMENT_COLONNES_MANUEL_.indexOf(titre) + 1);
-  });
+  rangementEcrireOnglet_(classeur, RANGEMENT_ONGLET_MANUEL_, RANGEMENT_COLONNES_MANUEL_, corpsManuel,
+    ['ID dossier', 'ID Drive', 'Clé Drive']);
   SpreadsheetApp.flush();
 
   SocleErreurs.absorber('rangement du classeur du plan dans son dossier',
@@ -368,10 +467,10 @@ const rangementPreparer_ = (proposition) => {
 
   return {
     id, url: classeur.getUrl(), cree: horodatage,
-    lignes: prepare.lignes, manuels: corpsManuel.length,
+    lignes, manuels: corpsManuel.length,
     absorptions: SocleErreurs.bilan(),
   };
-};
+});
 
 /* ------------------------------------------------------------ appliquer : une unité */
 
@@ -412,6 +511,40 @@ const rangementDossierSous_ = (parent, nom) => {
 };
 
 /**
+ * Le dossier désigné par `segments` sous Mon Drive, **sans rien créer** : ''
+ * s'il manque un niveau, ou si un niveau est ambigu. Sert à l'annulation, qui
+ * doit savoir où l'application a mis un élément sans rien toucher.
+ */
+const rangementChercherChemin_ = (segments) => {
+  let parent = rangementRacine_();
+  for (const nom of segments) {
+    const cle = `${parent}/${nom}`;
+    if (!RANGEMENT_PLAN_MEMOIRE_.dossiers[cle]) {
+      const trouves = rangementAppel_(() => Drive.Files.list({
+        q: `'${parent}' in parents and name = '${rangementEchapperRequete_(nom)}' `
+          + `and mimeType = '${RANGEMENT_MIME_DOSSIER_}' and trashed = false`,
+        fields: 'files(id)', pageSize: 3, corpora: 'user', spaces: 'drive',
+      })).files || [];
+      if (trouves.length !== 1) return '';
+      RANGEMENT_PLAN_MEMOIRE_.dossiers[cle] = trouves[0].id;
+    }
+    parent = RANGEMENT_PLAN_MEMOIRE_.dossiers[cle];
+  }
+  return parent;
+};
+
+/** Les niveaux d'un chemin saisi, sans « Mon Drive » en tête. */
+const rangementSegments_ = (texte) => {
+  const segments = String(texte ?? '').split('/').map((s) => s.trim()).filter((s) => s !== '');
+  // « Mon Drive / Compta » désigne Compta à la racine : on ne crée pas un
+  // dossier nommé « Mon Drive » (défaut de la v0.2).
+  if (segments.length > 0 && ['mon drive', 'my drive'].includes(segments[0].toLowerCase().replace(/\s+/g, ' '))) {
+    segments.shift();
+  }
+  return segments;
+};
+
+/**
  * L'identifiant du dossier de destination.
  *
  * Si la personne a modifié la colonne Destination, c'est **son** chemin qui
@@ -419,8 +552,8 @@ const rangementDossierSous_ = (parent, nom) => {
  * l'outil est alors ignoré. Le référentiel humain l'emporte sur le calcul.
  */
 const rangementDestination_ = (vue) => {
-  const texte = rangementTexteBrut_(vue.Destination).replace(/^'/, '');
-  const prevue = rangementTexteBrut_(vue['Destination prévue']).replace(/^'/, '');
+  const texte = rangementTexteBrut_(vue.Destination);
+  const prevue = rangementTexteBrut_(vue['Destination prévue']);
   const identifiant = rangementTexteBrut_(vue['ID destination']);
   if (identifiant && texte === prevue) {
     // Vérifiée une fois par exécution : trois cents fichiers rangés dans
@@ -438,7 +571,7 @@ const rangementDestination_ = (vue) => {
     RANGEMENT_PLAN_MEMOIRE_.destinations[identifiant] = true;
     return identifiant;
   }
-  const segments = texte.split('/').map((s) => s.trim()).filter((s) => s !== '');
+  const segments = rangementSegments_(texte);
   if (segments.length === 0) {
     throw SocleErreurs.erreur({
       quoi: 'La colonne Destination est vide.',
@@ -494,7 +627,7 @@ const rangementDeplacer_ = (vue) => {
     supportsAllDrives: true,
     fields: 'id,parents',
   }));
-  return `Déplacé vers « ${rangementTexteBrut_(vue.Destination).replace(/^'/, '')} ».`;
+  return `Déplacé vers « ${rangementTexteBrut_(vue.Destination)} ».`;
 };
 
 /**
@@ -519,7 +652,7 @@ const rangementCreerDrive_ = (vue, feuille, index) => {
     rangementAppel_(() => Drive.Drives.get(deja, { fields: 'id' }));
     return `Déjà créé (constaté) : ${deja}.`;
   }
-  const nom = rangementTexteBrut_(vue['Élément']).replace(/^'/, '');
+  const nom = rangementTexteBrut_(vue['Élément']);
   let drive;
   try {
     drive = rangementAppel_(() => Drive.Drives.create({ name: nom }, rangementTexteBrut_(vue['Jeton de création'])));
@@ -540,15 +673,34 @@ const rangementCreerDrive_ = (vue, feuille, index) => {
     drive = homonymes[0];
   }
   rangementEcrireCellule_(feuille, index, vue.numeroDeLigne, 'ID destination', drive.id);
+  if (RANGEMENT_PLAN_MEMOIRE_.drivesParCle) {
+    RANGEMENT_PLAN_MEMOIRE_.drivesParCle[rangementTexteBrut_(vue['Clé'])] = drive.id;
+  }
   return `Créé : ${rangementUrlDrive_(drive.id, true)}`;
 };
 
-/** L'identifiant du Drive créé par la ligne dont la clé est `cle`, lu dans le plan. */
+/** Clé → identifiant des Drives créés, tiré des lignes du plan. */
+const rangementCarteDrives_ = (lignes) => {
+  const carte = {};
+  lignes.filter((l) => rangementTexteBrut_(l.Action) === RANGEMENT_ACTIONS_.creerDrive)
+    .forEach((l) => { carte[rangementTexteBrut_(l['Clé'])] = rangementTexteBrut_(l['ID destination']); });
+  return carte;
+};
+
+/**
+ * L'identifiant du Drive créé par la ligne dont la clé est `cle`.
+ *
+ * Le plan est lu **une fois** par exécution, puis la carte est tenue à jour
+ * par les créations. La v0.2 relisait le plan entier pour chaque dossier à
+ * déplacer à la main : vingt dossiers, vingt lectures d'un plan de milliers
+ * de lignes.
+ */
 const rangementDriveDeCle_ = (classeur, cle) => {
-  const plan = rangementLireOnglet_(classeur, RANGEMENT_ONGLET_PLAN_);
-  const ligne = plan.lignes.find((l) => rangementTexteBrut_(l['Clé']) === cle
-    && rangementTexteBrut_(l.Action) === RANGEMENT_ACTIONS_.creerDrive);
-  return ligne ? rangementTexteBrut_(ligne['ID destination']) : '';
+  if (!RANGEMENT_PLAN_MEMOIRE_.drivesParCle) {
+    RANGEMENT_PLAN_MEMOIRE_.drivesParCle = rangementCarteDrives_(
+      rangementLireOnglet_(classeur, RANGEMENT_ONGLET_PLAN_).lignes);
+  }
+  return RANGEMENT_PLAN_MEMOIRE_.drivesParCle[cle] || '';
 };
 
 const rangementAjouterMembre_ = (vue, classeur) => {
@@ -568,7 +720,7 @@ const rangementAjouterMembre_ = (vue, classeur) => {
       quoiFaire: `Choisissez l'un de : ${Object.keys(RANGEMENT_ROLES_DRIVE_).join(', ')}.`,
     });
   }
-  const adresse = rangementTexteBrut_(vue['Élément']).replace(/^'/, '').toLowerCase();
+  const adresse = rangementTexteBrut_(vue['Élément']).toLowerCase();
   const membres = SocleApi.parcourir((jeton) => rangementAppel_(() => Drive.Permissions.list(driveId, {
     supportsAllDrives: true, pageSize: 100, pageToken: jeton, fields: 'nextPageToken, permissions(emailAddress,role)',
   })), { champ: 'permissions' }).elements;
@@ -627,6 +779,147 @@ const rangementOperation_ = (budgetMs) => {
   return RANGEMENT_PLAN_MEMOIRE_.operations[cle];
 };
 
+/* ------------------------------------------------------------ annuler un plan (v0.3) */
+
+/**
+ * Qu'une ligne « Fait » ait vraiment été déplacée par l'outil, et avec quelle
+ * certitude.
+ *
+ *   « Déplacé vers … »          l'outil l'a déplacé : fait ;
+ *   « Déjà à destination », au
+ *   deuxième départ ou plus     une tentative précédente a été interrompue
+ *                               après le déplacement : très probablement
+ *                               l'outil, d'où « présomption » ;
+ *   « Déjà à destination », au
+ *   premier départ              quelqu'un l'y avait mis avant l'outil : on ne
+ *                               défait pas ce que l'outil n'a pas fait.
+ */
+const rangementOrigineDuDeplacement_ = (ligne) => {
+  const detail = rangementTexteBrut_(ligne['Détail']);
+  if (detail.startsWith('Déplacé vers')) return 'fait';
+  if (detail.startsWith('Déjà à destination') && Number(ligne['Départs']) > 1) return 'présomption';
+  return '';
+};
+
+/** Le chemin du dossier parent, tiré de l'emplacement d'un élément. */
+const rangementCheminParent_ = (emplacement) => {
+  const segments = String(emplacement ?? '').split(' / ');
+  return segments.length > 1 ? segments.slice(0, -1).join(' / ') : 'Mon Drive';
+};
+
+/**
+ * Les lignes du plan inverse, et ce qui en est écarté, compté par cause.
+ *
+ * L'emplacement actuel attendu — là où l'application a mis l'élément — est
+ * l'identifiant de destination quand l'outil l'a utilisé tel quel, sinon le
+ * chemin résolu nom par nom **sans rien créer**. À l'application, le garde-fou
+ * ordinaire s'appliquera : un élément qui n'est plus là est laissé où il est.
+ */
+const rangementLignesAnnulation_ = (lignes, planOrigine) => {
+  const ecartees = { rattachements: 0, constatesSansDeplacement: 0, destinationsIntrouvables: 0 };
+  const inverses = [];
+  lignes.forEach((l) => {
+    const action = rangementTexteBrut_(l.Action);
+    if (rangementTexteBrut_(l['État']) !== 'Fait' || !RANGEMENT_ACTIONS_DEPLACEMENT_.includes(action)) return;
+    if (!RANGEMENT_ACTIONS_ANNULABLES_.includes(action)) { ecartees.rattachements += 1; return; }
+    const certitude = rangementOrigineDuDeplacement_(l);
+    if (!certitude) { ecartees.constatesSansDeplacement += 1; return; }
+
+    const destination = rangementTexteBrut_(l.Destination);
+    const identifiant = rangementTexteBrut_(l['ID destination']);
+    const actuel = identifiant && destination === rangementTexteBrut_(l['Destination prévue'])
+      ? identifiant : rangementChercherChemin_(rangementSegments_(destination));
+    if (!actuel) { ecartees.destinationsIntrouvables += 1; return; }
+
+    const retour = rangementCheminParent_(rangementTexteBrut_(l['Emplacement actuel']));
+    inverses.push({
+      Action: RANGEMENT_ACTIONS_.remettre,
+      Élément: rangementEnTexte_(l['Élément']),
+      'Emplacement actuel': rangementEnTexte_(destination),
+      Destination: rangementEnTexte_(retour),
+      Pourquoi: rangementEnTexte_(`Annule la ligne ${l.numero} du plan du ${planOrigine.cree}`
+        + (certitude === 'présomption' ? ' — constaté à destination après une tentative interrompue : '
+          + 'très probablement déplacé par l\'outil.' : '.')),
+      Certitude: certitude,
+      Lien: l.Lien,
+      Clé: `A${inverses.length + 1}`,
+      'ID élément': rangementTexteBrut_(l['ID élément']),
+      'ID parent d\'origine': actuel,
+      'ID destination': rangementTexteBrut_(l['ID parent d\'origine']),
+      'Destination prévue': rangementEnTexte_(retour),
+    });
+  });
+  return { inverses, ecartees };
+};
+
+/** Ce que l'outil ne défait pas, avec le lien pour le faire soi-même dans Drive. */
+const rangementADefaire_ = (lignes, manuels) => {
+  const corps = [];
+  lignes.filter((l) => rangementTexteBrut_(l.Action) === RANGEMENT_ACTIONS_.creerDrive
+    && rangementTexteBrut_(l['État']) === 'Fait').forEach((l) => {
+    const cle = rangementTexteBrut_(l['Clé']);
+    const membres = lignes.filter((m) => rangementTexteBrut_(m['Dépend de']) === cle
+      && rangementTexteBrut_(m['État']) === 'Fait').map((m) => rangementTexteBrut_(m['Élément']));
+    corps.push(['Drive partagé créé', rangementEnTexte_(l['Élément']),
+      rangementUrlDrive_(rangementTexteBrut_(l['ID destination']), true),
+      rangementEnTexte_(`Le supprimer se fait dans Drive, une fois vidé${membres.length
+        ? ` ; membres ajoutés par l'outil : ${membres.join(', ')}` : ''}.`)]);
+  });
+  manuels.filter((m) => rangementTexteBrut_(m['État']) === 'Fait (constaté)').forEach((m) => {
+    corps.push(['Dossier déplacé vers un Drive partagé', rangementEnTexte_(m.Dossier),
+      rangementUrlDrive_(rangementTexteBrut_(m['ID dossier']), true),
+      'Sa propriété est passée à l\'organisation. Le remettre dans Mon Drive se fait dans Drive.']);
+  });
+  lignes.filter((l) => rangementTexteBrut_(l.Action) === RANGEMENT_ACTIONS_.rattacher
+    && rangementTexteBrut_(l['État']) === 'Fait').forEach((l) => {
+    corps.push(['Élément rattaché', rangementEnTexte_(l['Élément']), l.Lien,
+      'Il n\'avait aucun dossier : l\'y remettre n\'aurait pas de sens. Déplacez-le vous-même si besoin.']);
+  });
+  return corps;
+};
+
+/**
+ * Prépare l'annulation du plan courant : un nouveau plan, inverse, qui devient
+ * le plan courant. Rien n'est coché ; le plan d'origine reste dans le Drive,
+ * intact, et le nouveau plan pointe vers lui.
+ */
+const rangementPreparerAnnulation_ = () => rangementSousVerrou_(() => {
+  const origine = rangementPlanCourant_();
+  const classeurOrigine = rangementClasseurPlan_();
+  if (PropertiesService.getUserProperties().getProperty(RANGEMENT_PROPRIETE_APPLICATION_)) {
+    throw SocleErreurs.erreur({
+      quoi: 'Une application de ce plan est encore en cours.',
+      quoiFaire: 'Attendez qu\'elle se termine, ou arrêtez-la, avant de préparer son annulation.',
+    });
+  }
+  const plan = rangementLireOnglet_(classeurOrigine, RANGEMENT_ONGLET_PLAN_);
+  const manuels = rangementLireOnglet_(classeurOrigine, RANGEMENT_ONGLET_MANUEL_).lignes;
+  const { inverses, ecartees } = rangementLignesAnnulation_(plan.lignes, origine);
+  const aDefaire = rangementADefaire_(plan.lignes, manuels);
+  if (inverses.length === 0 && aDefaire.length === 0) {
+    throw SocleErreurs.erreur({
+      quoi: 'Il n\'y a rien à annuler dans ce plan.',
+      quoiFaire: 'Seules les lignes « Fait » d\'un plan appliqué s\'annulent. Appliquez d\'abord le plan.',
+    });
+  }
+
+  const { classeur, id, horodatage, lignes } = rangementEcrireClasseur_({
+    nom: 'Annulation — Plan de rangement Drive',
+    modeEmploi: RANGEMENT_MODE_EMPLOI_ANNULATION_,
+    lignes: inverses,
+    pointeur: { annulation: { id: origine.id, url: origine.url, cree: origine.cree } },
+  });
+  rangementEcrireOnglet_(classeur, RANGEMENT_ONGLET_A_DEFAIRE_, RANGEMENT_COLONNES_A_DEFAIRE_, aDefaire);
+  SpreadsheetApp.flush();
+  SocleErreurs.absorber('rangement du classeur du plan dans son dossier',
+    () => rangementRangerClasseur_(id), null);
+
+  return {
+    id, url: classeur.getUrl(), cree: horodatage, lignes, ecartees, aDefaire: aDefaire.length,
+    absorptions: SocleErreurs.bilan(),
+  };
+});
+
 /* ------------------------------------------------------------ état, application, vérification */
 
 /**
@@ -651,6 +944,8 @@ const rangementEtat_ = () => {
     const e = rangementTexteBrut_(l['État']) || 'À faire';
     parEtat[e] = (parEtat[e] || 0) + 1;
   });
+  RANGEMENT_PLAN_MEMOIRE_.drivesParCle = rangementCarteDrives_(plan.lignes);
+  const echecs = plan.lignes.filter((l) => rangementTexteBrut_(l['État']) === 'Échec');
   const manuel = rangementLireOnglet_(classeur, RANGEMENT_ONGLET_MANUEL_);
   const application = PropertiesService.getUserProperties().getProperty(RANGEMENT_PROPRIETE_APPLICATION_);
   return {
@@ -661,12 +956,15 @@ const rangementEtat_ = () => {
     parAction,
     parEtat,
     notifications: parAction[RANGEMENT_ACTIONS_.ajouterMembre] || 0,
-    echecs: plan.lignes.filter((l) => rangementTexteBrut_(l['État']) === 'Échec')
-      .slice(0, 50).map((l) => ({ ligne: l.numero, action: l.Action, element: l['Élément'], detail: l['Détail'] })),
+    // Le nombre est le vrai nombre ; la liste n'en détaille que les premiers.
+    // La v0.2 comptait la liste, et affichait « 50 lignes en échec » pour 300.
+    nombreEchecs: echecs.length,
+    echecs: echecs.slice(0, RANGEMENT_ECHECS_DETAILLES_)
+      .map((l) => ({ ligne: l.numero, action: l.Action, element: l['Élément'], detail: l['Détail'] })),
     manuels: manuel.lignes.map((l) => ({
       ligne: l.numero,
-      dossier: rangementTexteBrut_(l.Dossier).replace(/^'/, ''),
-      drive: rangementTexteBrut_(l['Drive partagé']).replace(/^'/, ''),
+      dossier: rangementTexteBrut_(l.Dossier),
+      drive: rangementTexteBrut_(l['Drive partagé']),
       remarque: rangementTexteBrut_(l.Remarque),
       etat: rangementTexteBrut_(l['État']),
       verifie: SocleDates.horodatage(l['Vérifié le']),
@@ -674,6 +972,16 @@ const rangementEtat_ = () => {
       idDrive: rangementTexteBrut_(l['ID Drive']) || rangementDriveDeCle_(classeur, rangementTexteBrut_(l['Clé Drive'])),
     })),
     enCours: application ? JSON.parse(application) : null,
+    // Estimation sans appel à Drive : les destinations introuvables ne se
+    // comptent qu'à la préparation de l'annulation.
+    annulables: plan.lignes.filter((l) => rangementTexteBrut_(l['État']) === 'Fait'
+      && RANGEMENT_ACTIONS_ANNULABLES_.includes(rangementTexteBrut_(l.Action))
+      && rangementOrigineDuDeplacement_(l) !== '').length,
+    annulation: courant.annulation || null,
+    aDefaire: rangementLireOnglet_(classeur, RANGEMENT_ONGLET_A_DEFAIRE_).lignes.map((l) => ({
+      quoi: rangementTexteBrut_(l.Quoi), element: rangementTexteBrut_(l['Élément']),
+      lien: rangementTexteBrut_(l.Lien), comment: rangementTexteBrut_(l.Comment),
+    })),
   };
 };
 
@@ -701,11 +1009,26 @@ const rangementLancer_ = (confirme) => {
  * arrêtée —, rien n'est fait : un déclencheur resté en place après un arrêt
  * ne doit pas reprendre de lui-même.
  */
+const rangementRetirerDeclencheurs_ = () => {
+  let retires = 0;
+  ScriptApp.getProjectTriggers().forEach((d) => {
+    if (d.getHandlerFunction() === 'rangementReprendreApplication') {
+      ScriptApp.deleteTrigger(d);
+      retires += 1;
+    }
+  });
+  return retires;
+};
+
 const rangementPoursuivre_ = (budgetMs, depuisDeclencheur = false) => {
   const autorisation = PropertiesService.getUserProperties().getProperty(RANGEMENT_PROPRIETE_APPLICATION_);
   const courant = rangementPlanCourant_();
   if (!autorisation || !courant || JSON.parse(autorisation).plan !== courant.id) {
-    return { arrete: true, message: 'Aucune application en cours.' };
+    // Un déclencheur ponctuel reste inscrit au projet une fois exécuté. Réveillé
+    // sans rien à faire — application arrêtée, plan remplacé —, il doit se
+    // retirer, sinon ils s'accumulent vers la limite de vingt (défaut de la v0.2).
+    const retires = depuisDeclencheur ? rangementRetirerDeclencheurs_() : 0;
+    return { arrete: true, message: 'Aucune application en cours.', declencheursRetires: retires };
   }
   const operation = rangementOperation_(budgetMs);
   const bilan = depuisDeclencheur ? operation.reprendre() : operation.appliquer();
@@ -717,14 +1040,7 @@ const rangementPoursuivre_ = (budgetMs, depuisDeclencheur = false) => {
 
 const rangementArreter_ = () => {
   PropertiesService.getUserProperties().deleteProperty(RANGEMENT_PROPRIETE_APPLICATION_);
-  let retires = 0;
-  ScriptApp.getProjectTriggers().forEach((d) => {
-    if (d.getHandlerFunction() === 'rangementReprendreApplication') {
-      ScriptApp.deleteTrigger(d);
-      retires += 1;
-    }
-  });
-  return { arrete: true, declencheursRetires: retires };
+  return { arrete: true, declencheursRetires: rangementRetirerDeclencheurs_() };
 };
 
 /**

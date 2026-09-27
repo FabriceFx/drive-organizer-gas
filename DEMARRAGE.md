@@ -80,6 +80,7 @@ Pour désactiver : supprimez la propriété, ou exécutez `rangementDefinirCleIa
 2. Dans Sheets, cocher **Valider** sur les lignes approuvées ; corriger une Destination si besoin. Rien n'est coché d'office.
 3. Onglet **Application** : relire le décompte, confirmer, suivre. La fenêtre peut se fermer : l'application continue en arrière-plan.
 4. Faire glisser dans Drive les dossiers listés « À faire vous-même », puis **Vérifier les déplacements**.
+5. Pour revenir en arrière : **Annuler ce plan**, dans l'onglet Application. Un plan inverse s'écrit ; on le relit, on coche, on applique. L'onglet *À défaire dans Drive* liste ce que l'outil ne défait pas lui-même.
 
 Le premier « Préparer le plan » redemande l'autorisation : l'outil demande désormais
 d'écrire dans Drive et dans Sheets (voir [les portées](README.md#portées-demandées)).
@@ -108,5 +109,7 @@ l'application affiche le numéro de version qui tourne.
 | Bandeau « certaines données n'ont pas pu être lues » | Les résultats qui en dépendent sont marqués « non mesuré ». Relancez plus tard. |
 | Ligne « Échec » : *pas pu être créé* (Drive partagé) | L'organisation interdit peut-être la création de Drives partagés (console d'administration > Applications > Google Workspace > Drive et Docs > Paramètres de partage > Création de Drive partagé). Autorisez-la, ou créez le Drive vous-même et préparez un nouveau plan. |
 | Ligne « Échec » : *déplacé depuis la préparation* | Voulu : l'outil ne déplace pas sur la foi d'un plan périmé. Relancez une analyse pour un plan à jour. |
+| « Une application de plan est en cours » en préparant un plan | Une passe tourne encore (autre onglet, ou arrière-plan). Attendez la fin, ou **Arrêter** dans l'onglet Application. |
+| Annulation : lignes « écartées, dossier renommé ou supprimé » | Le dossier où le rangement avait mis ces éléments n'existe plus sous ce nom : remettez-les à la main, ou rendez son nom au dossier et préparez de nouveau l'annulation. |
 | Application figée sur « une autre application tourne » | Un autre onglet ou le déclencheur de reprise travaille. Attendez, ou **Arrêter** puis relancez. |
 | Erreur « imprévue » avec une référence | Cherchez l'heure de la référence dans **Exécutions** de l'éditeur : le détail technique y est. |

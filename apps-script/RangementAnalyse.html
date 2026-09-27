@@ -1,0 +1,961 @@
+<!--
+  Rangement Drive — analyse. Introduite en v0.1.
+
+  Fonctions pures : des enregistrements en entrée, un rapport en sortie, aucun
+  accès au DOM ni à Google. C'est ce qui permet au banc de les exécuter dans
+  Node exactement comme le navigateur les exécute (banc/test.js extrait ce
+  script et le charge dans un contexte vierge).
+
+  Chaque verdict porte son calcul. Un score qui ne sait pas dire pourquoi il
+  est ce qu'il est ne survit pas à la première contestation — et ici, la
+  contestation viendra de la personne dont on juge le rangement.
+
+  Deux mots reviennent partout, et ne se confondent pas :
+    fait         ce que Drive a rendu, sans interprétation ;
+    présomption  ce que l'outil en déduit, et qui peut être faux.
+-->
+<script>
+const RangementAnalyse = (() => {
+  'use strict';
+
+  const JOUR_MS = 24 * 3600 * 1000;
+
+  /** Les limites que Google oppose au déplacement d'un dossier vers un Drive partagé. */
+  const LIMITES_GOOGLE = {
+    // « 25 or more items are unmovable » ou « 10% or more » : le déplacement est refusé.
+    inamoviblesMax: 25,
+    inamoviblesPart: 0.10,
+    elementsParDeplacement: 100000,
+    profondeurDrivePartage: 20,
+  };
+
+  const MARQUES_COPIE = /^(copie de|copy of)\s|\s\(\d+\)(\.[a-z0-9]{1,5})?$/i;
+  const SANS_TITRE = /^(sans titre|untitled|document sans titre|feuille de calcul sans titre|présentation sans titre|formulaire sans titre|nouveau dossier|new folder|untitled (document|spreadsheet|presentation|form))(\s*\(\d+\))?$/i;
+
+  /**
+   * Jetons de version artisanale. « final », « v2 », « relu »… L'historique
+   * des versions de Drive fait ce travail ; les copier à la main fabrique des
+   * doublons dont personne ne sait lequel fait foi.
+   */
+  const MOTIF_VERSION = '(^|[\\s_\\-.(])(v\\d{1,3}|version ?\\d{1,3}|finale?s?|def|definitif|definitive|définitif|définitive|vf|ok|relue?|corrigée?|corrige|new|nouveau|nouvelle|old|ancienn?e?|bis|ter|draft|brouillon)(?=$|[\\s_\\-.)])';
+
+  /**
+   * Deux expressions, et non une seule : une expression globale garde sa
+   * position entre deux appels à `test`, et rend un résultat sur deux faux
+   * sur une liste de noms. Le drapeau `g` ne sert qu'au remplacement.
+   */
+  const A_UNE_VERSION = new RegExp(MOTIF_VERSION, 'i');
+  const JETONS_VERSION = new RegExp(MOTIF_VERSION, 'gi');
+
+  const MOTS_VIDES = new Set(['de', 'du', 'des', 'la', 'le', 'les', 'et', 'en', 'a', 'au', 'aux', 'pour',
+    'sur', 'par', 'the', 'of', 'and', 'for', 'to', 'in', 'd', 'l', 'un', 'une', 'copie', 'copy',
+    'dossier', 'folder', 'fichier', 'document', 'nouveau', 'new', 'divers', 'autres']);
+
+  /* ------------------------------------------------------------ outils */
+
+  const sansAccents = (texte) => String(texte ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '');
+  const comparable = (texte) => sansAccents(texte).toLowerCase().replace(/\s+/g, ' ').trim();
+
+  /** Mots porteurs d'un nom : sans extension, sans mots vides, sans nombres seuls. */
+  const mots = (nom) => comparable(String(nom).replace(/\.[a-z0-9]{1,5}$/i, ''))
+    .split(/[^a-z0-9]+/)
+    .filter((m) => m.length > 2 && !MOTS_VIDES.has(m) && !/^\d+$/.test(m));
+
+  /** Écart en jours entre deux dates `yyyy-MM-dd`. `null` si l'une manque : non mesuré. */
+  const ecartJours = (depuis, jusqua) => {
+    if (!depuis || !jusqua) return null;
+    return Math.round((Date.parse(`${jusqua}T00:00:00Z`) - Date.parse(`${depuis}T00:00:00Z`)) / JOUR_MS);
+  };
+
+  const pourcent = (part) => `${Math.round(part * 100)} %`;
+  const pluriel = (n, un, plusieurs) => `${n} ${n < 2 ? un : plusieurs}`;
+
+  const domaineDe = (adresse) => {
+    const texte = String(adresse ?? '');
+    const arobase = texte.lastIndexOf('@');
+    return arobase === -1 ? '' : texte.slice(arobase + 1).toLowerCase();
+  };
+
+  const jaccard = (a, b) => {
+    if (a.size === 0 && b.size === 0) return 0;
+    let commun = 0;
+    a.forEach((x) => { if (b.has(x)) commun += 1; });
+    return commun / (a.size + b.size - commun);
+  };
+
+  /* ------------------------------------------------------------ l'arbre */
+
+  /**
+   * Situe chaque élément :
+   *
+   *   arborescence  sous « Mon Drive » ;
+   *   orphelin      à soi, et sans aucun dossier parent — ce que Drive appelle
+   *                 « is:unorganized ». Un fichier à soi posé dans le dossier
+   *                 d'un collègue n'est pas orphelin : il est rangé, ailleurs ;
+   *   hors          tout le reste : partagé avec soi hors de son arborescence,
+   *                 ou contenu d'un dossier orphelin (le rattacher suffit).
+   *
+   * La remontée est mémorisée et protégée contre les boucles : Drive n'en
+   * produit pas en principe, mais une boucle ferait geler l'onglet, et le coût
+   * de la garde est nul.
+   */
+  const construireArbre = (elements, racineId) => {
+    const parId = new Map();
+    elements.forEach((e) => parId.set(e.id, e));
+
+    const COUPE = { lieu: 'coupe', profondeur: 0, ancetres: [], id: '' };
+    const situation = new Map();   // id → { lieu, profondeur, ancetres: [ids, du plus haut au plus bas] }
+
+    const situer = (depart) => {
+      const pile = [];
+      const vus = new Set();
+      let courant = depart;
+      let dessus;   // situation du parent du maillon le plus haut de la pile
+      for (;;) {
+        pile.push(courant);
+        vus.add(courant.id);
+        if (courant.parent === racineId) {
+          dessus = { lieu: 'arborescence', profondeur: 0, ancetres: [], id: '' };
+          break;
+        }
+        const parent = parId.get(courant.parent);
+        if (!parent || vus.has(parent.id)) { dessus = COUPE; break; }
+        if (situation.has(parent.id)) { dessus = { ...situation.get(parent.id), id: parent.id }; break; }
+        courant = parent;
+      }
+      // On redescend la pile : chaque maillon hérite de celui du dessus.
+      for (let i = pile.length - 1; i >= 0; i -= 1) {
+        const s = dessus.lieu === 'arborescence'
+          ? {
+            lieu: 'arborescence',
+            profondeur: dessus.profondeur + 1,
+            ancetres: dessus.id ? [...dessus.ancetres, dessus.id] : [],
+          }
+          : { lieu: 'coupe', profondeur: 0, ancetres: [] };
+        situation.set(pile[i].id, s);
+        dessus = { ...s, id: pile[i].id };
+      }
+    };
+    elements.forEach((e) => { if (!situation.has(e.id)) situer(e); });
+
+    elements.forEach((e) => {
+      const s = situation.get(e.id);
+      if (s.lieu === 'coupe') s.lieu = e.aMoi && !e.parent ? 'orphelin' : 'hors';
+    });
+
+    const chemins = new Map();
+    const chemin = (e) => {
+      if (chemins.has(e.id)) return chemins.get(e.id);
+      const s = situation.get(e.id);
+      const texte = s.lieu !== 'arborescence' ? e.nom
+        : [...s.ancetres.map((id) => parId.get(id).nom), e.nom].join(' / ');
+      chemins.set(e.id, texte);
+      return texte;
+    };
+
+    return { parId, situation, chemin };
+  };
+
+  /* ------------------------------------------------------------ agrégats par dossier */
+
+  /**
+   * Cumule, pour chaque dossier, ce que contient tout son sous-arbre.
+   * Une remontée par élément : proportionnel au nombre d'éléments fois la
+   * profondeur moyenne, soit quelques centaines de milliers d'opérations pour
+   * un gros Drive — rien pour un navigateur.
+   */
+  const agreger = (elements, arbre, contexte) => {
+    const internes = new Set(contexte.domainesInternes || []);
+    const estInterne = (adresse) => internes.has(domaineDe(adresse));
+    const agregats = new Map();
+
+    elements.forEach((e) => {
+      if (e.genre !== 'dossier' || arbre.situation.get(e.id).lieu !== 'arborescence') return;
+      agregats.set(e.id, {
+        fichiersDirects: 0, dossiersDirects: 0, fichiers: 0, dossiers: 0, octets: 0,
+        dernierModifie: '', dernierVu: '',
+        modifiesParAutres: 0, modificateurConnu: 0, apportesParAutres: 0, externes: 0,
+        contributeurs: new Map(), profondeurSous: 0,
+      });
+    });
+
+    elements.forEach((e) => {
+      const s = arbre.situation.get(e.id);
+      if (s.lieu !== 'arborescence') return;
+      const direct = agregats.get(e.parent);
+      if (direct) {
+        if (e.genre === 'dossier') direct.dossiersDirects += 1;
+        else direct.fichiersDirects += 1;
+      }
+      s.ancetres.forEach((id, rang) => {
+        const a = agregats.get(id);
+        if (!a) return;
+        a.profondeurSous = Math.max(a.profondeurSous, s.ancetres.length - rang);
+        if (e.genre === 'dossier') { a.dossiers += 1; return; }
+        a.fichiers += 1;
+        a.octets += e.octets || 0;
+        if (e.modifie > a.dernierModifie) a.dernierModifie = e.modifie;
+        if (e.vu > a.dernierVu) a.dernierVu = e.vu;
+        if (e.modifiePar) {
+          a.modificateurConnu += 1;
+          if (e.modifiePar !== 'moi') {
+            a.modifiesParAutres += 1;
+            a.contributeurs.set(e.modifiePar, (a.contributeurs.get(e.modifiePar) || 0) + 1);
+          }
+        }
+        if (!e.aMoi) {
+          a.apportesParAutres += 1;
+          if (e.proprietaire && !estInterne(e.proprietaire)) a.externes += 1;
+        }
+      });
+    });
+    return agregats;
+  };
+
+  /* ------------------------------------------------------------ constats */
+
+  const GRAVITES = ['critique', 'serieux', 'avertissement', 'neutre'];
+
+  const constat = (code, gravite, titre, objet, explication, calcul, conseil, certitude = 'fait', elements = []) => ({
+    code, gravite, titre, objet, explication, calcul, conseil, certitude, elements,
+  });
+
+  const objetDe = (e, arbre) => ({ id: e.id, nom: e.nom, genre: e.genre, chemin: arbre.chemin(e) });
+
+  const estPersonnel = (nom, motsPersonnels) => {
+    const texte = ` ${comparable(nom).replace(/[^a-z0-9]+/g, ' ')} `;
+    return motsPersonnels.some((m) => m && texte.includes(` ${m} `));
+  };
+
+  const listeMotsPersonnels = (reglages) => String(reglages.motsPersonnels || '')
+    .split(/[,;\n]+/).map((m) => comparable(m).replace(/[^a-z0-9]+/g, ' ').trim()).filter((m) => m !== '');
+
+  /** Retire les marques de copie et de version pour retrouver le nom « de fond ». */
+  const radical = (nom) => comparable(String(nom)
+    .replace(/\.[a-z0-9]{1,5}$/i, '')
+    .replace(/^(copie de|copy of)\s+/i, '')
+    .replace(/\s*\(\d+\)$/, '')
+    .replace(JETONS_VERSION, ' ')
+    .replace(/[\s_\-.]+/g, ' '));
+
+  /** Formats de date reconnus dans un nom de fichier. */
+  const FORMATS_DATE = [
+    ['aaaa-mm-jj', /(^|\D)(19|20)\d{2}-[01]\d-[0-3]\d(\D|$)/],
+    ['jj/mm/aaaa', /(^|\D)[0-3]?\d[/.-][01]?\d[/.-](19|20)\d{2}(\D|$)/],
+    ['aaaammjj', /(^|\D)(19|20)\d{2}[01]\d[0-3]\d(\D|$)/],
+    ['jj mois aaaa', /(^|\s)[0-3]?\d(er)?\s(janv|fev|févr|mars|avr|mai|juin|juil|aout|août|sept|oct|nov|dec|déc)[a-zéû]*\.?\s(19|20)\d{2}/i],
+  ];
+
+  const formatDate = (nom) => {
+    const trouve = FORMATS_DATE.find(([, motif]) => motif.test(nom));
+    return trouve ? trouve[0] : '';
+  };
+
+  const produireConstats = (elements, arbre, agregats, contexte, reglages) => {
+    const liste = [];
+    const dansArbre = elements.filter((e) => arbre.situation.get(e.id).lieu === 'arborescence');
+    const dossiers = dansArbre.filter((e) => e.genre === 'dossier');
+    const fichiers = dansArbre.filter((e) => e.genre !== 'dossier');
+
+    // Racine encombrée
+    const aLaRacine = fichiers.filter((e) => e.parent === contexte.racineId);
+    if (aLaRacine.length > reglages.racineMax) {
+      liste.push(constat('RACINE_ENCOMBREE',
+        aLaRacine.length > 3 * reglages.racineMax ? 'serieux' : 'avertissement',
+        `${pluriel(aLaRacine.length, 'fichier posé', 'fichiers posés')} à la racine de Mon Drive`,
+        { id: contexte.racineId, nom: 'Mon Drive', genre: 'dossier', chemin: 'Mon Drive' },
+        'La racine est l\'entrée de votre Drive : tout ce qui y traîne se retrouve à chaque ouverture, '
+          + 'et rien n\'y indique à quel sujet un fichier appartient.',
+        `${aLaRacine.length} fichiers comptés directement sous « Mon Drive », pour un seuil de ${reglages.racineMax}.`,
+        'Voir l\'onglet « Hiérarchie proposée » : chaque fichier y reçoit une destination, ou « À trier » '
+          + 'quand aucune ne se déduit de son nom.',
+        'fait', aLaRacine.map((e) => objetDe(e, arbre))));
+    }
+
+    // Orphelins
+    const orphelins = elements.filter((e) => arbre.situation.get(e.id).lieu === 'orphelin');
+    if (orphelins.length > 0) {
+      liste.push(constat('ORPHELINS', 'serieux',
+        `${pluriel(orphelins.length, 'élément', 'éléments')} sans dossier`,
+        null,
+        'Ces éléments vous appartiennent mais ne sont rangés nulle part : on ne les retrouve que par la '
+          + 'recherche. C\'est typiquement ce qui reste quand quelqu\'un supprime le dossier partagé où '
+          + 'vous aviez déposé un fichier.',
+        'Éléments dont vous êtes propriétaire et dont aucun dossier parent n\'est accessible '
+          + 'depuis « Mon Drive ».',
+        'Dans Drive, la recherche « is:unorganized owner:me » les retrouve. Rattachez-les, ou supprimez-les.',
+        'fait', orphelins.map((e) => objetDe(e, arbre))));
+    }
+
+    // Profondeur excessive : seulement le premier niveau fautif de chaque branche
+    dossiers.forEach((d) => {
+      const s = arbre.situation.get(d.id);
+      if (s.profondeur !== reglages.profondeurMax + 1) return;
+      const a = agregats.get(d.id);
+      liste.push(constat('PROFONDEUR', 'avertissement',
+        `Dossier au ${s.profondeur}e niveau`,
+        objetDe(d, arbre),
+        'Au-delà de quelques niveaux, on ne retrouve plus un fichier en naviguant : on le cherche. '
+          + 'Chaque niveau de plus est un clic, et une décision de rangement de plus à prendre.',
+        `Profondeur ${s.profondeur} (seuil ${reglages.profondeurMax}), `
+          + `et ${pluriel(a.profondeurSous, 'niveau', 'niveaux')} encore en dessous.`,
+        'Remontez ce dossier, ou fusionnez les niveaux intermédiaires qui ne contiennent que lui.'));
+    });
+
+    // Fourre-tout
+    dossiers.forEach((d) => {
+      const a = agregats.get(d.id);
+      if (a.fichiersDirects < reglages.fourreToutMin) return;
+      liste.push(constat('FOURRE_TOUT', 'avertissement',
+        `${a.fichiersDirects} fichiers au même niveau`,
+        objetDe(d, arbre),
+        'Un dossier de cette taille ne se parcourt plus : il sert de débarras.',
+        `${a.fichiersDirects} fichiers directement dans ce dossier, pour un seuil de ${reglages.fourreToutMin}.`,
+        'Scindez-le par sujet, ou par année si ce sont des pièces datées (factures, comptes rendus).'));
+    });
+
+    // Vides, et niveaux qui ne contiennent qu'un dossier
+    dossiers.forEach((d) => {
+      if (!d.aMoi) return;
+      const a = agregats.get(d.id);
+      if (a.fichiersDirects === 0 && a.dossiersDirects === 0) {
+        liste.push(constat('DOSSIER_VIDE', 'neutre', 'Dossier vide', objetDe(d, arbre),
+          'Un dossier vide encombre la navigation sans rien ranger.',
+          'Aucun élément dedans, d\'après le balayage.',
+          'Supprimez-le, sauf s\'il sert de boîte de dépôt à quelqu\'un.'));
+      } else if (a.fichiersDirects === 0 && a.dossiersDirects === 1) {
+        liste.push(constat('NIVEAU_INUTILE', 'neutre', 'Dossier qui ne contient qu\'un dossier', objetDe(d, arbre),
+          'Ce niveau n\'apporte qu\'un clic de plus.',
+          'Aucun fichier, un seul sous-dossier.',
+          'Remontez le sous-dossier d\'un niveau et supprimez celui-ci.'));
+      }
+    });
+
+    // Dossiers homonymes
+    const parNom = new Map();
+    dossiers.forEach((d) => {
+      const cle = comparable(d.nom);
+      if (/^\d+$/.test(cle) || cle.length < 3) return; // « 2024 », « 01 » : une structure, pas un doublon
+      if (!parNom.has(cle)) parNom.set(cle, []);
+      parNom.get(cle).push(d);
+    });
+    parNom.forEach((groupe) => {
+      if (groupe.length < 2) return;
+      // Client A / Factures, Client B / Factures : structure régulière, pas un doublon.
+      const grandsParents = new Set(groupe.map((d) => (arbre.parId.get(d.parent) || {}).parent || ''));
+      const profondeurs = new Set(groupe.map((d) => arbre.situation.get(d.id).profondeur));
+      if (grandsParents.size === 1 && profondeurs.size === 1) return;
+      liste.push(constat('DOSSIERS_HOMONYMES', 'avertissement',
+        `${groupe.length} dossiers « ${groupe[0].nom} » à des endroits différents`,
+        objetDe(groupe[0], arbre),
+        'Le même sujet rangé à plusieurs endroits : chaque nouveau fichier oblige à choisir, et le choix '
+          + 'change d\'une fois sur l\'autre.',
+        `Noms identiques (casse et accents ignorés), à des profondeurs ou sous des branches différentes : `
+          + `${groupe.map((d) => arbre.chemin(d)).join(' · ')}.`,
+        'Vérifiez s\'il s\'agit du même sujet ; si oui, fusionnez-les.',
+        'présomption', groupe.map((d) => objetDe(d, arbre))));
+    });
+
+    // Copies, sans-titre
+    const copies = fichiers.filter((e) => MARQUES_COPIE.test(e.nom));
+    if (copies.length > 0) {
+      liste.push(constat('COPIES', copies.length > 50 ? 'avertissement' : 'neutre',
+        `${pluriel(copies.length, 'copie', 'copies')} au nom d'origine`,
+        null,
+        '« Copie de… » et « (1) » sont les traces d\'un doublement, rarement d\'une intention.',
+        'Noms commençant par « Copie de » ou « Copy of », ou finissant par « (1) », « (2) »…',
+        'Renommez celles qui ont une raison d\'être ; supprimez les autres après vérification.',
+        'fait', copies.map((e) => objetDe(e, arbre))));
+    }
+    const sansTitre = dansArbre.filter((e) => SANS_TITRE.test(e.nom.trim()));
+    if (sansTitre.length > 0) {
+      liste.push(constat('SANS_TITRE', 'neutre',
+        `${pluriel(sansTitre.length, 'élément', 'éléments')} sans titre`,
+        null,
+        'Un élément sans titre ne se retrouve que par hasard.',
+        'Noms par défaut de Google : « Sans titre », « Document sans titre », « Nouveau dossier »…',
+        'Donnez-leur un nom, ou supprimez ceux qui sont vides.',
+        'fait', sansTitre.map((e) => objetDe(e, arbre))));
+    }
+
+    // Doublons probables : même nom de fond, même taille, même type. Une taille
+    // nulle ne prouve rien (anciens fichiers Google, raccourcis) : écartée.
+    const empreintes = new Map();
+    fichiers.forEach((e) => {
+      const fond = radical(e.nom);
+      if (!(e.octets > 0) || fond === '') return;
+      const cle = `${e.genre}|${e.octets}|${fond}`;
+      if (!empreintes.has(cle)) empreintes.set(cle, []);
+      empreintes.get(cle).push(e);
+    });
+    empreintes.forEach((groupe) => {
+      if (groupe.length < 2) return;
+      liste.push(constat('DOUBLONS_PROBABLES', 'avertissement',
+        `${groupe.length} exemplaires de « ${groupe[0].nom} »`,
+        objetDe(groupe[0], arbre),
+        'Plusieurs exemplaires du même fichier : lequel fait foi ?',
+        `Même nom une fois retirées les marques de copie et de version, même type, même taille `
+          + `(${groupe[0].octets} octets). Le contenu n'a pas été lu : c'est une présomption.`,
+        'Gardez-en un seul, et remplacez les autres par un raccourci si plusieurs dossiers en ont besoin.',
+        'présomption', groupe.map((e) => objetDe(e, arbre))));
+    });
+
+    // Versions manuelles : dans un même dossier, des noms qui ne diffèrent que
+    // par une marque de version, dont au moins un en porte une.
+    const parFond = new Map();
+    fichiers.forEach((e) => {
+      const fond = radical(e.nom);
+      if (fond === '') return;
+      const cle = `${e.parent}|${fond}`;
+      if (!parFond.has(cle)) parFond.set(cle, []);
+      parFond.get(cle).push(e);
+    });
+    parFond.forEach((memeFond, cle) => {
+      if (memeFond.length < 2 || !memeFond.some((e) => A_UNE_VERSION.test(e.nom))) return;
+      const fond = cle.slice(cle.indexOf('|') + 1);
+      liste.push(constat('VERSIONS_MANUELLES', 'neutre',
+        `${memeFond.length} versions manuelles de « ${fond} »`,
+        objetDe(arbre.parId.get(memeFond[0].parent) || memeFond[0], arbre),
+        'Drive garde déjà l\'historique des versions de chaque fichier (Fichier > Historique des versions). '
+          + 'Les copies « v2 », « final », « relu » dispersent le travail entre plusieurs fichiers.',
+        `Dans le même dossier, ${memeFond.length} fichiers dont le nom ne diffère que par une marque de version.`,
+        'Gardez le fichier de référence, nommez ses versions importantes dans l\'historique, archivez le reste.',
+        'présomption', memeFond.map((e) => objetDe(e, arbre))));
+    });
+
+    // Formats de date mélangés dans un même dossier
+    const formatsParDossier = new Map();
+    fichiers.forEach((e) => {
+      const f = formatDate(e.nom);
+      if (!f) return;
+      if (!formatsParDossier.has(e.parent)) formatsParDossier.set(e.parent, new Map());
+      const m = formatsParDossier.get(e.parent);
+      m.set(f, (m.get(f) || 0) + 1);
+    });
+    formatsParDossier.forEach((formats, idDossier) => {
+      if (formats.size < 2) return;
+      const dossier = arbre.parId.get(idDossier);
+      const detail = [...formats.entries()].map(([f, n]) => `${f} (${n})`).join(', ');
+      liste.push(constat('DATES_MELANGEES', 'neutre',
+        'Dates écrites de plusieurs façons dans les noms',
+        dossier ? objetDe(dossier, arbre)
+          : { id: idDossier, nom: 'Mon Drive', genre: 'dossier', chemin: 'Mon Drive' },
+        'Seul le format aaaa-mm-jj en tête de nom se trie dans l\'ordre chronologique. '
+          + 'Mélanger les écritures, c\'est renoncer au tri.',
+        `Formats relevés dans les noms de ce dossier : ${detail}.`,
+        'Adoptez « 2026-09-27 Objet » pour les pièces datées.'));
+    });
+
+    // Branches dormantes : le plus haut dossier dont tout le contenu dort. Ce
+    // qui est déjà dans des archives n'est pas à y envoyer.
+    const dormant = (d) => {
+      const a = agregats.get(d.id);
+      const ecart = ecartJours(a.dernierModifie, contexte.aujourdhui);
+      return a.fichiers > 0 && ecart !== null && ecart > reglages.dormantAnnees * 365;
+    };
+    const archive = (d) => [...arbre.situation.get(d.id).ancetres.map((id) => arbre.parId.get(id)), d]
+      .some((x) => /archiv/.test(comparable(x.nom)));
+    dossiers.forEach((d) => {
+      if (!dormant(d) || archive(d)) return;
+      const parent = arbre.parId.get(d.parent);
+      if (parent && agregats.has(parent.id) && dormant(parent)) return;
+      const a = agregats.get(d.id);
+      liste.push(constat('DORMANT', 'neutre',
+        `Rien n'a bougé ici depuis ${a.dernierModifie.slice(0, 4)}`,
+        objetDe(d, arbre),
+        'Une branche que personne ne touche plus alourdit la navigation quotidienne. '
+          + 'Elle a sa place dans des archives, pas au milieu du travail en cours.',
+        `Dernière modification du contenu le ${a.dernierModifie}, `
+          + `sur ${pluriel(a.fichiers, 'fichier', 'fichiers')} ; seuil de ${reglages.dormantAnnees} ans.`,
+        'Déplacez-la dans « Archives », rangées par année.'));
+    });
+
+    return liste.sort((a, b) => GRAVITES.indexOf(a.gravite) - GRAVITES.indexOf(b.gravite));
+  };
+
+  /* ------------------------------------------------------------ candidats au Drive partagé */
+
+  const ROLES_ECRITURE = new Set(['writer', 'fileOrganizer', 'organizer']);
+
+  /**
+   * Le score d'un dossier comme candidat au Drive partagé, avec son détail.
+   *
+   * Quatre signaux, chacun plafonné, et chacun affiché avec sa contribution :
+   *   éditeurs internes du dossier           30 points au plus
+   *   part des fichiers modifiés par d'autres 30
+   *   part des fichiers apportés par d'autres 20
+   *   activité récente                        20
+   *
+   * Pourquoi ces signaux : un dossier de Mon Drive dont d'autres sont les
+   * principaux auteurs est un dossier d'équipe hébergé chez une personne. Le
+   * jour où son compte est supprimé, l'équipe perd le dossier, et les fichiers
+   * que les autres y ont déposés perdent leur rangement.
+   */
+  const scorer = (d, agregat, contexte, reglages, motsPersonnels) => {
+    const internes = new Set(contexte.domainesInternes || []);
+    const moi = String(contexte.adresse || '').toLowerCase();
+    const detail = [];
+    let score = 0;
+
+    const permissions = d.permissions;
+    let editeurs = 0;
+    const membres = new Map();
+    const externes = new Set();
+    let partageLarge = false;
+    if (!Array.isArray(permissions)) {
+      detail.push({ signal: 'Éditeurs du dossier', points: 0, texte: 'non mesuré : Google ne rend pas '
+        + 'les partages d\'un dossier que vous ne pouvez pas partager' });
+    } else {
+      permissions.forEach((p) => {
+        if (p.type === 'anyone' || p.type === 'domain') { partageLarge = true; return; }
+        const adresse = p.adresse;
+        if (!adresse || adresse === moi) return;
+        const interne = internes.has(domaineDe(adresse));
+        if (!interne) { externes.add(adresse); return; }
+        membres.set(adresse, { adresse, role: p.role, groupe: p.type === 'group' });
+        if (ROLES_ECRITURE.has(p.role)) editeurs += p.type === 'group' ? 3 : 1;
+      });
+      const points = Math.min(editeurs, 3) * 10;
+      score += points;
+      detail.push({ signal: 'Éditeurs du dossier', points,
+        texte: editeurs === 0 ? 'aucun collègue en écriture'
+          : `${pluriel(editeurs, 'collègue', 'collègues')} en écriture (un groupe compte pour 3), 10 points chacun, 30 au plus` });
+    }
+
+    if (agregat.modificateurConnu >= 3) {
+      const part = agregat.modifiesParAutres / agregat.modificateurConnu;
+      const points = Math.round(part * 30);
+      score += points;
+      detail.push({ signal: 'Modifications par d\'autres', points,
+        texte: `${pourcent(part)} des fichiers modifiés en dernier par quelqu'un d'autre `
+          + `(${agregat.modifiesParAutres} sur ${agregat.modificateurConnu})` });
+    } else {
+      detail.push({ signal: 'Modifications par d\'autres', points: 0,
+        texte: 'non mesuré : moins de 3 fichiers dont l\'auteur de la dernière modification est connu' });
+    }
+
+    if (agregat.fichiers >= 3) {
+      const part = agregat.apportesParAutres / agregat.fichiers;
+      const points = Math.round(part * 20);
+      score += points;
+      detail.push({ signal: 'Fichiers apportés par d\'autres', points,
+        texte: `${pourcent(part)} des fichiers appartiennent à quelqu'un d'autre `
+          + `(${agregat.apportesParAutres} sur ${agregat.fichiers})` });
+    } else {
+      detail.push({ signal: 'Fichiers apportés par d\'autres', points: 0, texte: 'non mesuré : moins de 3 fichiers' });
+    }
+
+    const ecart = ecartJours(agregat.dernierModifie, contexte.aujourdhui);
+    const pointsActivite = ecart === null ? 0 : (ecart <= 90 ? 20 : (ecart <= 365 ? 10 : 0));
+    score += pointsActivite;
+    detail.push({ signal: 'Activité', points: pointsActivite,
+      texte: ecart === null ? 'non mesuré : aucune date de modification'
+        : `dernière modification il y a ${pluriel(ecart, 'jour', 'jours')} (20 points sous 90 jours, 10 sous un an)` });
+
+    const personnel = estPersonnel(d.nom, motsPersonnels);
+    if (personnel) {
+      detail.push({ signal: 'Nom personnel', points: -score,
+        texte: 'le nom évoque la vie privée : un tel dossier ne se confie pas à une équipe, quel que soit son partage' });
+      score = 0;
+    }
+
+    return { score, detail, membres, externes, partageLarge, personnel };
+  };
+
+  /** Ce que Google fera ou refusera au déplacement, d'après sa documentation. */
+  const obstacles = (agregat) => {
+    const liste = [];
+    const total = agregat.fichiers + agregat.dossiers;
+    if (agregat.externes > 0) {
+      const part = total > 0 ? agregat.externes / total : 0;
+      const refuse = agregat.externes >= LIMITES_GOOGLE.inamoviblesMax || part >= LIMITES_GOOGLE.inamoviblesPart;
+      liste.push({
+        bloquant: refuse,
+        texte: refuse
+          ? `${agregat.externes} éléments appartiennent à des personnes extérieures à l'organisation `
+            + `(${pourcent(part)}) : Google refuse le déplacement au-delà de 25 éléments ou de 10 %. `
+            + 'Demandez d\'abord à leurs propriétaires de les retirer, ou déplacez le dossier par morceaux.'
+          : `${pluriel(agregat.externes, 'élément appartient', 'éléments appartiennent')} à des personnes extérieures : `
+            + 'Google les laissera dans le Drive de leur propriétaire et mettra un raccourci à la place.',
+      });
+    }
+    if (total > LIMITES_GOOGLE.elementsParDeplacement) {
+      liste.push({ bloquant: true, texte: `${total} éléments : Google refuse de déplacer plus de 100 000 éléments à la fois.` });
+    }
+    if (agregat.profondeurSous + 1 > LIMITES_GOOGLE.profondeurDrivePartage) {
+      liste.push({ bloquant: true, texte: `${agregat.profondeurSous + 1} niveaux de dossiers : un Drive partagé n'en accepte que 20.` });
+    }
+    return liste;
+  };
+
+  const produireCandidats = (elements, arbre, agregats, contexte, reglages, drivesPartages) => {
+    const motsPersonnels = listeMotsPersonnels(reglages);
+    const evalues = new Map();
+    elements.forEach((e) => {
+      if (!agregats.has(e.id)) return;
+      evalues.set(e.id, scorer(e, agregats.get(e.id), contexte, reglages, motsPersonnels));
+    });
+
+    const candidats = [];
+    evalues.forEach((ev, id) => {
+      if (ev.score < reglages.seuilAExaminer) return;
+      const d = arbre.parId.get(id);
+      // Le plus haut dossier retenu suffit : ses sous-dossiers partent avec lui.
+      const ancetreRetenu = arbre.situation.get(id).ancetres
+        .some((a) => evalues.has(a) && evalues.get(a).score >= reglages.seuilAExaminer);
+      if (ancetreRetenu) return;
+      const agregat = agregats.get(id);
+      const sousRetenus = elements.filter((e) => evalues.has(e.id)
+        && evalues.get(e.id).score >= reglages.seuilAExaminer
+        && arbre.situation.get(e.id).ancetres.includes(id)).length;
+
+      const cercle = new Set(ev.membres.keys());
+      const existants = (drivesPartages || [])
+        .filter((dp) => Array.isArray(dp.membres))
+        .map((dp) => {
+          const membresDp = new Set(dp.membres.map((m) => m.adresse).filter((a) => a && a !== contexte.adresse));
+          return { id: dp.id, nom: dp.nom, proximite: jaccard(cercle, membresDp) };
+        })
+        .filter((x) => x.proximite >= 0.6)
+        .sort((a, b) => b.proximite - a.proximite)
+        .slice(0, 3);
+
+      candidats.push({
+        id, nom: d.nom, chemin: arbre.chemin(d),
+        score: ev.score,
+        niveau: ev.score >= reglages.seuilDrivePartage ? 'recommande' : 'a_examiner',
+        detail: ev.detail,
+        membres: [...ev.membres.values()].map((m) => ({
+          adresse: m.adresse, groupe: m.groupe,
+          // Google donne « Gestionnaire de contenu » aux anciens éditeurs : on propose la même chose.
+          roleDrive: ROLES_ECRITURE.has(m.role) ? 'Gestionnaire de contenu'
+            : (m.role === 'commenter' ? 'Commentateur' : 'Lecteur'),
+        })),
+        externes: [...ev.externes],
+        partageLarge: ev.partageLarge,
+        fichiers: agregat.fichiers, dossiers: agregat.dossiers, octets: agregat.octets,
+        contributeurs: [...agregat.contributeurs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+          .map(([adresse, n]) => ({ adresse, modifications: n })),
+        sousDossiersAussiCandidats: sousRetenus,
+        obstacles: obstacles(agregat),
+        drivesExistants: existants,
+      });
+    });
+    return candidats.sort((a, b) => b.score - a.score);
+  };
+
+  /**
+   * Regroupe les candidats qui servent à la même équipe : un Drive partagé par
+   * équipe, pas un par dossier. Même cercle de collègues (Jaccard ≥ 0,5) →
+   * même Drive. Union-find, pour que la transitivité ne dépende pas de l'ordre.
+   */
+  const produireCercles = (candidats) => {
+    const parent = candidats.map((_, i) => i);
+    const trouver = (i) => (parent[i] === i ? i : (parent[i] = trouver(parent[i])));
+    const ensembles = candidats.map((c) => new Set(c.membres.map((m) => m.adresse)));
+    for (let i = 0; i < candidats.length; i += 1) {
+      for (let j = i + 1; j < candidats.length; j += 1) {
+        if (ensembles[i].size > 0 && jaccard(ensembles[i], ensembles[j]) >= 0.5) parent[trouver(i)] = trouver(j);
+      }
+    }
+    const groupes = new Map();
+    candidats.forEach((c, i) => {
+      const r = trouver(i);
+      if (!groupes.has(r)) groupes.set(r, []);
+      groupes.get(r).push(c);
+    });
+    return [...groupes.values()].map((groupe) => {
+      const frequences = new Map();
+      groupe.forEach((c) => new Set(mots(c.nom)).forEach((m) => frequences.set(m, (frequences.get(m) || 0) + 1)));
+      const meilleur = [...frequences.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)[0];
+      const nomPropose = groupe.length === 1 ? groupe[0].nom
+        : (meilleur && meilleur[1] > 1 ? meilleur[0].charAt(0).toUpperCase() + meilleur[0].slice(1)
+          : `Équipe de ${groupe[0].nom}`);
+      const membres = new Map();
+      groupe.forEach((c) => c.membres.forEach((m) => {
+        const deja = membres.get(m.adresse);
+        if (!deja || deja.roleDrive === 'Lecteur') membres.set(m.adresse, m);
+      }));
+      return {
+        nomPropose,
+        origineNom: groupe.length === 1 ? 'nom du dossier'
+          : (meilleur && meilleur[1] > 1 ? `mot commun à ${meilleur[1]} des noms de dossiers` : 'aucun mot commun : nom à choisir'),
+        dossiers: groupe.map((c) => c.id),
+        membres: [...membres.values()],
+        drivesExistants: groupe.flatMap((c) => c.drivesExistants)
+          .filter((x, i, t) => t.findIndex((y) => y.id === x.id) === i),
+      };
+    });
+  };
+
+  /* ------------------------------------------------------------ hiérarchie proposée */
+
+  /**
+   * Des mouvements, chacun motivé, et l'arbre qui en résulte. Rien n'est
+   * appliqué : c'est un plan à relire. Les mouvements tirés d'un rapprochement
+   * de noms sont marqués « présomption ».
+   */
+  const produireHierarchie = (elements, arbre, agregats, constats, candidats, cercles, contexte, reglages) => {
+    const mouvements = [];
+    const deplaces = new Set();
+    const motsPersonnels = listeMotsPersonnels(reglages);
+    const hautNiveau = elements.filter((e) => e.genre === 'dossier' && e.parent === contexte.racineId
+      && arbre.situation.get(e.id).lieu === 'arborescence');
+
+    // 1. Vers les Drives partagés
+    const parId = new Map(candidats.map((c) => [c.id, c]));
+    cercles.forEach((cercle) => {
+      cercle.dossiers.forEach((id) => {
+        const c = parId.get(id);
+        if (c.niveau !== 'recommande') return;
+        const existant = cercle.drivesExistants[0];
+        mouvements.push({
+          action: 'drive_partage', source: { id, chemin: c.chemin, nom: c.nom },
+          destination: existant ? `Drive partagé existant « ${existant.nom} »` : `Nouveau Drive partagé « ${cercle.nomPropose} »`,
+          raison: `score ${c.score}/100 — ${c.detail.filter((x) => x.points > 0).map((x) => x.signal.toLowerCase()).join(', ')}`,
+          certitude: 'présomption',
+        });
+        deplaces.add(id);
+      });
+    });
+
+    // 2. Branches dormantes vers les archives
+    constats.filter((c) => c.code === 'DORMANT').forEach((c) => {
+      const ancetres = arbre.situation.get(c.objet.id).ancetres;
+      if (deplaces.has(c.objet.id) || ancetres.some((a) => deplaces.has(a))) return;
+      const annee = agregats.get(c.objet.id).dernierModifie.slice(0, 4);
+      mouvements.push({
+        action: 'archiver', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
+        destination: `Archives / ${annee}`, raison: c.calcul, certitude: 'fait',
+      });
+      deplaces.add(c.objet.id);
+    });
+
+    // 3. Dossiers personnels de premier niveau regroupés
+    const personnels = hautNiveau.filter((d) => !deplaces.has(d.id) && estPersonnel(d.nom, motsPersonnels));
+    if (personnels.length >= 2) {
+      personnels.forEach((d) => {
+        mouvements.push({
+          action: 'regrouper', source: { id: d.id, chemin: arbre.chemin(d), nom: d.nom },
+          destination: 'Personnel', raison: 'nom évoquant la vie privée ; regroupés, ils ne se mêlent plus au travail',
+          certitude: 'présomption',
+        });
+        deplaces.add(d.id);
+      });
+    }
+
+    // 4. Fichiers de la racine : vers le dossier dont le vocabulaire est le plus proche
+    const vocabulaire = hautNiveau.filter((d) => !deplaces.has(d.id)).map((d) => {
+      const ensemble = new Set(mots(d.nom));
+      elements.forEach((e) => {
+        if (e.genre === 'dossier' && arbre.situation.get(e.id).ancetres[0] === d.id) mots(e.nom).forEach((m) => ensemble.add(m));
+      });
+      return { dossier: d, mots: ensemble };
+    });
+    elements.filter((e) => e.genre !== 'dossier' && e.parent === contexte.racineId
+      && arbre.situation.get(e.id).lieu === 'arborescence')
+      .forEach((f) => {
+        const siens = mots(f.nom);
+        let meilleur = null;
+        vocabulaire.forEach((v) => {
+          const communs = siens.filter((m) => v.mots.has(m));
+          if (communs.length > 0 && (!meilleur || communs.length > meilleur.communs.length)) meilleur = { v, communs };
+        });
+        const annee = (f.modifie || '').slice(0, 4);
+        mouvements.push(meilleur
+          ? {
+            action: 'ranger', source: { id: f.id, chemin: arbre.chemin(f), nom: f.nom },
+            destination: meilleur.v.dossier.nom,
+            raison: `mot${meilleur.communs.length > 1 ? 's' : ''} commun${meilleur.communs.length > 1 ? 's' : ''} : ${meilleur.communs.join(', ')}`,
+            certitude: 'présomption',
+          }
+          : {
+            action: 'ranger', source: { id: f.id, chemin: arbre.chemin(f), nom: f.nom },
+            destination: annee ? `À trier / ${annee}` : 'À trier',
+            raison: 'aucun dossier existant ne partage de mot avec ce nom : à classer à la main',
+            certitude: 'fait',
+          });
+      });
+
+    // 5. Orphelins
+    elements.filter((e) => arbre.situation.get(e.id).lieu === 'orphelin').forEach((e) => {
+      mouvements.push({
+        action: 'rattacher', source: { id: e.id, chemin: e.nom, nom: e.nom },
+        destination: 'À trier / Sans dossier', raison: 'élément à vous, rangé nulle part', certitude: 'fait',
+      });
+    });
+
+    // 6. Niveaux inutiles et doublons de dossiers : simplifications en place
+    constats.filter((c) => c.code === 'NIVEAU_INUTILE').forEach((c) => {
+      mouvements.push({
+        action: 'aplatir', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
+        destination: 'son contenu remonte d\'un niveau', raison: c.calcul, certitude: 'fait',
+      });
+    });
+    constats.filter((c) => c.code === 'DOSSIERS_HOMONYMES').forEach((c) => {
+      mouvements.push({
+        action: 'fusionner', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
+        destination: `un seul « ${c.objet.nom} »`, raison: c.calcul, certitude: 'présomption',
+      });
+    });
+
+    // L'arbre cible, au premier niveau : ce qui reste, et ce qui naît
+    const cible = new Map();
+    const noeud = (nom, genre) => {
+      if (!cible.has(nom)) cible.set(nom, { nom, genre, entrees: 0, sous: new Map() });
+      return cible.get(nom);
+    };
+    hautNiveau.filter((d) => !deplaces.has(d.id)).forEach((d) => {
+      noeud(d.nom, 'existant').entrees += 1 + (agregats.get(d.id).fichiers + agregats.get(d.id).dossiers);
+    });
+    mouvements.forEach((m) => {
+      if (m.action === 'drive_partage' || m.action === 'aplatir' || m.action === 'fusionner') return;
+      const [tete, ...reste] = m.destination.split(' / ');
+      const n = noeud(tete, cible.has(tete) ? cible.get(tete).genre : 'nouveau');
+      n.entrees += 1;
+      if (reste.length) n.sous.set(reste.join(' / '), (n.sous.get(reste.join(' / ')) || 0) + 1);
+    });
+    const drives = new Map();
+    mouvements.filter((m) => m.action === 'drive_partage').forEach((m) => {
+      drives.set(m.destination, (drives.get(m.destination) || 0) + 1);
+    });
+
+    return {
+      mouvements,
+      monDrive: [...cible.values()].map((n) => ({
+        nom: n.nom, genre: n.genre, entrees: n.entrees,
+        sous: [...n.sous.entries()].sort().map(([nom, entrees]) => ({ nom, entrees })),
+      })).sort((a, b) => (a.genre === b.genre ? a.nom.localeCompare(b.nom, 'fr') : (a.genre === 'existant' ? -1 : 1))),
+      drivesPartages: [...drives.entries()].map(([nom, dossiers]) => ({ nom, dossiers })),
+    };
+  };
+
+  /* ------------------------------------------------------------ indice de rangement */
+
+  /**
+   * Une note sur 100, et surtout son détail : chaque pénalité dit d'où elle
+   * vient et combien elle pèse. La note n'est qu'un résumé ; c'est la liste
+   * qui se discute.
+   */
+  const produireIndice = (elements, arbre, agregats, constats, candidats, reglages) => {
+    const dansArbre = elements.filter((e) => arbre.situation.get(e.id).lieu === 'arborescence');
+    const fichiers = dansArbre.filter((e) => e.genre !== 'dossier').length || 1;
+    const compte = (code) => constats.filter((c) => c.code === code);
+    const nbElements = (code) => compte(code).reduce((s, c) => s + Math.max(1, c.elements.length), 0);
+    const penalites = [];
+    const penaliser = (libelle, points, maximum, calcul) => {
+      const p = Math.min(maximum, Math.round(points));
+      if (p > 0) penalites.push({ libelle, points: p, maximum, calcul });
+    };
+
+    const racine = (compte('RACINE_ENCOMBREE')[0] || { elements: [] }).elements.length;
+    penaliser('Racine encombrée', (racine - reglages.racineMax) / 2, 20,
+      `1 point par tranche de 2 fichiers au-delà de ${reglages.racineMax} à la racine (${racine} comptés)`);
+    const orphelins = nbElements('ORPHELINS');
+    penaliser('Éléments sans dossier', orphelins, 15, `1 point par élément rangé nulle part (${orphelins})`);
+    penaliser('Dossiers fourre-tout', compte('FOURRE_TOUT').length * 3, 15, '3 points par dossier fourre-tout');
+    penaliser('Arborescence trop profonde', compte('PROFONDEUR').length * 2, 10, '2 points par branche trop profonde');
+    const bruit = nbElements('COPIES') + nbElements('SANS_TITRE') + nbElements('VERSIONS_MANUELLES');
+    penaliser('Copies, sans-titre, versions manuelles', (bruit / fichiers) * 100, 15,
+      `1 point par pour-cent des fichiers (${bruit} sur ${fichiers})`);
+    const enEquipe = candidats.filter((c) => c.niveau === 'recommande').reduce((s, c) => s + c.fichiers, 0);
+    penaliser('Travail d\'équipe hébergé dans Mon Drive', (enEquipe / fichiers) * 50, 25,
+      `0,5 point par pour-cent des fichiers situés dans un dossier recommandé pour un Drive partagé (${enEquipe} sur ${fichiers})`);
+
+    const total = penalites.reduce((s, p) => s + p.points, 0);
+    return { note: Math.max(0, 100 - total), penalites };
+  };
+
+  /* ------------------------------------------------------------ résumé pour l'IA */
+
+  /**
+   * Ce qui partirait vers l'IA, et rien d'autre : chemins de dossiers et
+   * compteurs. Ni noms de fichiers, ni adresses, ni identifiants Drive — les
+   * références d1, d2… ne valent que pour cette demande, et la table qui les
+   * relie aux dossiers reste dans le navigateur.
+   */
+  const resumePourIa = (rapport, maximum) => {
+    const { arbre, agregats, candidats, constats } = rapport.interne;
+    const candidatsIds = new Set(candidats.map((c) => c.id));
+    const dormants = new Set(constats.filter((c) => c.code === 'DORMANT').map((c) => c.objet.id));
+    const motsPersonnels = listeMotsPersonnels(rapport.reglages);
+    const retenus = [...agregats.keys()]
+      .map((id) => arbre.parId.get(id))
+      .sort((a, b) => arbre.situation.get(a.id).profondeur - arbre.situation.get(b.id).profondeur
+        || agregats.get(b.id).fichiers - agregats.get(a.id).fichiers)
+      .slice(0, maximum);
+    const table = new Map();
+    const dossiers = retenus.map((d, i) => {
+      const ref = `d${i + 1}`;
+      table.set(ref, d.id);
+      const a = agregats.get(d.id);
+      const collaborateurs = Array.isArray(d.permissions) ? d.permissions.filter((p) => p.adresse).length : 0;
+      return {
+        ref, chemin: arbre.chemin(d).slice(0, 300),
+        fichiers: a.fichiers, sousDossiers: a.dossiers, collaborateurs,
+        annee: (a.dernierModifie || '').slice(0, 4),
+        candidatDrivePartage: candidatsIds.has(d.id),
+        dormant: dormants.has(d.id),
+        personnel: estPersonnel(d.nom, motsPersonnels),
+      };
+    });
+    const parCode = {};
+    constats.forEach((c) => { parCode[c.code] = (parCode[c.code] || 0) + 1; });
+    return { envoi: { dossiers, constats: parCode }, table, tronque: agregats.size > maximum, total: agregats.size };
+  };
+
+  /* ------------------------------------------------------------ export CSV */
+
+  /**
+   * Une cellule qui commence par =, +, - ou @ devient une formule à
+   * l'ouverture dans un tableur. Un fichier nommé « =HYPERLINK(…) » ne doit
+   * pas s'exécuter chez la personne qui ouvre l'export : on le préfixe d'une
+   * apostrophe, que le tableur n'affiche pas.
+   */
+  const celluleCsv = (valeur) => {
+    let texte = String(valeur ?? '');
+    if (/^[=+\-@\t\r]/.test(texte)) texte = `'${texte}`;
+    return /[";\n\r]/.test(texte) ? `"${texte.replace(/"/g, '""')}"` : texte;
+  };
+
+  /** Point-virgule et BOM : c'est ce qu'attend un tableur réglé en français. */
+  const csv = (lignes) => `\ufeff${lignes.map((l) => l.map(celluleCsv).join(';')).join('\r\n')}`;
+
+  /* ------------------------------------------------------------ point d'entrée */
+
+  const analyser = (elements, contexte, reglages, drivesPartages) => {
+    const arbre = construireArbre(elements, contexte.racineId);
+    const agregats = agreger(elements, arbre, contexte);
+    const constats = produireConstats(elements, arbre, agregats, contexte, reglages);
+    const candidats = produireCandidats(elements, arbre, agregats, contexte, reglages, drivesPartages);
+    const cercles = produireCercles(candidats);
+    const hierarchie = produireHierarchie(elements, arbre, agregats, constats, candidats, cercles, contexte, reglages);
+    const indice = produireIndice(elements, arbre, agregats, constats, candidats, reglages);
+
+    const lieux = { arborescence: 0, orphelin: 0, hors: 0 };
+    arbre.situation.forEach((s) => { lieux[s.lieu] += 1; });
+    let profondeurMax = 0;
+    arbre.situation.forEach((s) => { if (s.profondeur > profondeurMax) profondeurMax = s.profondeur; });
+
+    return {
+      reglages,
+      synthese: {
+        elements: elements.length,
+        ...lieux,
+        dossiers: agregats.size,
+        profondeurMax,
+        constatsParGravite: GRAVITES.reduce((o, g) => ({ ...o, [g]: constats.filter((c) => c.gravite === g).length }), {}),
+      },
+      indice, constats, candidats, cercles, hierarchie,
+      // Pour le résumé IA et l'affichage des origines ; jamais sérialisé.
+      interne: { arbre, agregats, candidats, constats },
+    };
+  };
+
+  return {
+    analyser, resumePourIa, csv,
+    // Exposés pour le banc.
+    construireArbre, agreger, radical, formatDate, mots, estPersonnel, jaccard, LIMITES_GOOGLE,
+  };
+})();
+</script>

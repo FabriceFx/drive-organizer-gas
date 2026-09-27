@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= SocleWeb.inclure('SocleStyle') ?>
+  <style>
+    /* Classes propres au projet, préfixées « r- » comme celles du socle le sont de « s- ». */
+    .r-entete { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-pas-4); flex-wrap: wrap; }
+    .r-onglets { display: flex; gap: var(--s-pas-1); flex-wrap: wrap; border-bottom: 1px solid var(--s-bordure); margin: var(--s-pas-4) 0; }
+    .r-onglets button {
+      font: inherit; background: none; border: none; color: var(--s-texte-doux);
+      padding: var(--s-pas-2) var(--s-pas-3); cursor: pointer; border-bottom: 3px solid transparent;
+    }
+    .r-onglets button[aria-selected="true"] { color: var(--s-primaire); border-bottom-color: var(--s-primaire); font-weight: 500; }
+    .r-onglets button:focus-visible { outline: 2px solid var(--s-primaire); outline-offset: -2px; }
+    .r-note { font-size: 3rem; line-height: 1; font-variant-numeric: tabular-nums; }
+    .r-arbre, .r-arbre ul { list-style: none; margin: 0; padding-left: var(--s-pas-4); }
+    .r-arbre { padding-left: 0; }
+    .r-arbre li { padding: 2px 0; }
+    .r-arbre li::before { content: '📁 '; }
+    .r-arbre li.r-drive::before { content: '👥 '; }
+    .r-arbre li.r-nouveau > .r-nom { font-style: italic; }
+    .r-badges { display: inline-flex; gap: var(--s-pas-1); flex-wrap: wrap; }
+    .r-detail summary { cursor: pointer; color: var(--s-lien); }
+    .r-detail ul { margin: var(--s-pas-2) 0 0; padding-left: var(--s-pas-5); max-height: 320px; overflow: auto; }
+    .r-apercu { max-height: 320px; overflow: auto; background: var(--s-surface-basse); padding: var(--s-pas-3);
+      border-radius: var(--s-rayon-s); font-family: var(--s-police-chiffres); font-size: var(--s-legende); white-space: pre-wrap; }
+    .r-champs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: var(--s-pas-4); }
+    .r-pied { margin-top: var(--s-pas-5); text-align: center; }
+    /* Les marges par défaut des paragraphes s'ajoutent à l'écart de .s-pile : on n'en garde qu'un. */
+    .s-pile > p, .s-pile > ul, .s-pile > ol, .s-pile > dl { margin: 0; }
+    .s-tableau td.s-nombre { white-space: nowrap; }
+    .r-cache { display: none !important; }
+    @media (max-width: 600px) { .s-page { padding: var(--s-pas-4); } }
+  </style>
+</head>
+<body class="s-page">
+  <main class="s-pile" id="application">
+    <header class="r-entete">
+      <div>
+        <h1 class="s-titre">Rangement de mon Drive</h1>
+        <p class="s-doux" id="qui">Préparation…</p>
+      </div>
+    </header>
+
+    <!-- Accueil -->
+    <section id="ecran-accueil" class="s-pile r-cache">
+      <div class="s-carte s-pile">
+        <h2 class="s-sous-titre">Ce que fait cet outil</h2>
+        <p>Il parcourt votre Drive et vous montre, sans rien modifier :</p>
+        <ul>
+          <li>les <strong>dossiers d'équipe hébergés dans Mon Drive</strong>, qui seraient mieux dans un Drive
+            partagé — le jour où votre compte est supprimé, vos collègues les perdent ;</li>
+          <li>le <strong>désordre</strong> : racine encombrée, dossiers fourre-tout ou trop profonds, copies,
+            « sans titre », versions faites à la main, fichiers rangés nulle part ;</li>
+          <li>une <strong>hiérarchie proposée</strong>, où chaque déplacement dit pourquoi.</li>
+        </ul>
+        <div class="s-bandeau">
+          <div>
+            <strong>Ce qui est lu :</strong> les noms, dossiers, dates, propriétaires et partages de vos
+            fichiers. <strong>Jamais leur contenu.</strong> L'outil n'a pas le droit de modifier quoi que ce
+            soit : vous gardez la main sur chaque rangement. Rien n'est envoyé hors de Google, sauf si
+            vous demandez vous-même une proposition à l'IA, après avoir vu ce qui partira.
+          </div>
+        </div>
+        <div class="s-rangee">
+          <button class="s-bouton s-bouton--primaire" id="bouton-analyser">Analyser mon Drive</button>
+          <span class="s-legende">Compter une à deux secondes par millier de fichiers.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Balayage -->
+    <section id="ecran-balayage" class="s-pile r-cache">
+      <div class="s-carte s-pile">
+        <h2 class="s-sous-titre" id="balayage-titre">Lecture de votre Drive…</h2>
+        <div class="s-progression" role="progressbar" aria-label="Lecture en cours">
+          <div class="s-progression__part" id="balayage-barre" style="width: 5%"></div>
+        </div>
+        <p class="s-chiffres" id="balayage-compte" aria-live="polite">0 élément lu</p>
+        <p class="s-legende">Google ne dit pas à l'avance combien d'éléments compte un Drive : la barre avance
+          par page lue, sans prétendre à un pourcentage.</p>
+        <div id="balayage-erreur"></div>
+        <div class="s-rangee">
+          <button class="s-bouton" id="bouton-arreter">Arrêter et analyser ce qui est lu</button>
+          <button class="s-bouton s-bouton--primaire r-cache" id="bouton-reprendre">Reprendre la lecture</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Rapport -->
+    <section id="ecran-rapport" class="r-cache">
+      <div id="rapport-bandeaux" class="s-pile"></div>
+      <nav class="r-onglets" role="tablist" id="onglets"></nav>
+      <div id="contenu" class="s-pile"></div>
+    </section>
+
+    <div id="erreur-generale"></div>
+
+    <footer class="r-pied s-legende" id="pied">Rangement Drive</footer>
+  </main>
+
+  <?!= SocleWeb.inclure('SocleWebClient') ?>
+  <?!= SocleWeb.inclure('RangementAnalyse') ?>
+  <?!= SocleWeb.inclure('RangementClient') ?>
+</body>
+</html>

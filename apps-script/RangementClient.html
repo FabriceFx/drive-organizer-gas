@@ -1,0 +1,701 @@
+<!--
+  Rangement Drive — interface. Introduite en v0.1.
+
+  Tout le DOM est construit par `el()`, qui pose le texte par nœud texte et
+  jamais par innerHTML : un nom de fichier comme « <img onerror=…> » s'affiche
+  tel quel au lieu de s'exécuter. Le banc vérifie qu'aucun innerHTML n'apparaît
+  dans ce fichier — c'est plus sûr que de vérifier que chacun est échappé.
+-->
+<script>
+(() => {
+  'use strict';
+
+  /* ------------------------------------------------------------ état */
+
+  const etat = {
+    contexte: null,
+    elements: [],
+    jeton: null,
+    pages: 0,
+    arret: false,
+    complet: false,
+    drives: null,
+    drivesIncomplet: false,
+    drivesEchec: '',
+    rapport: null,
+    onglet: 'synthese',
+    filtreGravite: 'tous',
+    filtreAction: 'tous',
+    ia: { taille: 200, consentement: false, enCours: false, resultat: null, resume: null, erreur: '' },
+  };
+
+  /* ------------------------------------------------------------ outils d'affichage */
+
+  const $ = (id) => document.getElementById(id);
+
+  const el = (balise, attributs, ...enfants) => {
+    const noeud = document.createElement(balise);
+    Object.entries(attributs || {}).forEach(([cle, valeur]) => {
+      if (valeur === null || valeur === undefined || valeur === false) return;
+      if (cle === 'classe') noeud.className = valeur;
+      else if (cle.startsWith('on') && typeof valeur === 'function') noeud.addEventListener(cle.slice(2), valeur);
+      else noeud.setAttribute(cle, valeur === true ? '' : String(valeur));
+    });
+    enfants.flat(Infinity).forEach((enfant) => {
+      if (enfant === null || enfant === undefined || enfant === false) return;
+      noeud.append(enfant instanceof Node ? enfant : String(enfant));
+    });
+    return noeud;
+  };
+
+  const remplacer = (conteneur, ...enfants) => {
+    while (conteneur.firstChild) conteneur.removeChild(conteneur.firstChild);
+    enfants.flat(Infinity).forEach((e) => { if (e) conteneur.append(e); });
+  };
+
+  const montrer = (id, visible) => $(id).classList.toggle('r-cache', !visible);
+
+  const nombre = (n) => Number(n || 0).toLocaleString('fr-FR');
+  const pluriel = (n, un, plusieurs) => `${nombre(n)} ${Number(n) < 2 ? un : plusieurs}`;
+
+  const MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août',
+    'septembre', 'octobre', 'novembre', 'décembre'];
+  /** « 6 septembre 2026 » : la conversion appartient à l'affichage, jamais à la donnée. */
+  const dateLisible = (jour) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(jour || ''));
+    return m ? `${Number(m[3])} ${MOIS[Number(m[2]) - 1]} ${m[1]}` : '';
+  };
+
+  const taille = (octets) => {
+    const o = Number(octets) || 0;
+    if (o < 1024 * 1024) return `${Math.round(o / 1024)} Ko`;
+    if (o < 1024 * 1024 * 1024) return `${(o / 1024 / 1024).toFixed(1).replace('.', ',')} Mo`;
+    return `${(o / 1024 / 1024 / 1024).toFixed(1).replace('.', ',')} Go`;
+  };
+
+  const urlDrive = (id, genre) => (genre === 'dossier'
+    ? `https://drive.google.com/drive/folders/${encodeURIComponent(id)}`
+    : `https://drive.google.com/open?id=${encodeURIComponent(id)}`);
+
+  const lienDrive = (objet, texte) => (objet && objet.id
+    ? el('a', { href: urlDrive(objet.id, objet.genre), target: '_blank', rel: 'noopener' }, texte || objet.chemin || objet.nom)
+    : el('span', null, texte || ''));
+
+  const ETIQUETTES_GRAVITE = { critique: 'Critique', serieux: 'Sérieux', avertissement: 'À revoir', neutre: 'Suggestion' };
+  const badgeGravite = (g) => el('span', { classe: `s-etat s-etat--${g}` }, ETIQUETTES_GRAVITE[g] || g);
+  const badgeCertitude = (c) => (c === 'présomption'
+    ? el('span', { classe: 's-etat s-etat--neutre', title: 'Déduit par l\'outil, et peut être faux : à vérifier.' }, 'présomption')
+    : el('span', { classe: 's-etat s-etat--bon', title: 'Constaté dans les données de Drive.' }, 'fait'));
+
+  const bandeau = (genre, ...contenu) => el('div', { classe: `s-bandeau${genre ? ` s-bandeau--${genre}` : ''}` }, el('div', null, contenu));
+
+  const carte = (...contenu) => el('div', { classe: 's-carte s-pile' }, contenu);
+
+  const erreurLisible = (erreur) => {
+    const ref = erreur && erreur.reference ? ` (référence ${erreur.reference})` : '';
+    return `${(erreur && erreur.message) || erreur}${ref}`;
+  };
+
+  /* ------------------------------------------------------------ démarrage */
+
+  const demarrer = async () => {
+    try {
+      etat.contexte = await socle.demander('rangementDemarrer');
+      const c = etat.contexte;
+      remplacer($('qui'), `${c.nom} — ${c.adresse}`);
+      remplacer($('pied'), `Rangement Drive v${c.version} · lecture seule · `,
+        el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); ouvrirOnglet('aide'); } }, 'aide et fonctionnement'));
+      montrer('ecran-accueil', true);
+    } catch (erreur) {
+      remplacer($('erreur-generale'), bandeau('critique',
+        el('strong', null, 'L\'outil n\'a pas pu démarrer. '), erreurLisible(erreur),
+        ' Rechargez la page ; si le problème persiste, transmettez ce message à l\'administrateur.'));
+    }
+  };
+
+  /* ------------------------------------------------------------ balayage */
+
+  const majProgression = () => {
+    remplacer($('balayage-compte'), `${pluriel(etat.elements.length, 'élément lu', 'éléments lus')} · `
+      + `${pluriel(etat.pages, 'page', 'pages')}`);
+    // Progression asymptotique : elle avance à chaque page sans jamais prétendre finir.
+    $('balayage-barre').style.width = `${Math.round(95 * (1 - 1 / (1 + etat.pages / 5)))}%`;
+  };
+
+  const lire = async () => {
+    montrer('bouton-reprendre', false);
+    montrer('bouton-arreter', true);
+    remplacer($('balayage-erreur'));
+    try {
+      do {
+        if (etat.arret) break;
+        const page = await socle.demander('rangementBalayerPage', [etat.jeton]);
+        Array.prototype.push.apply(etat.elements, page.elements);
+        etat.jeton = page.jetonSuivant;
+        etat.pages += 1;
+        majProgression();
+      } while (etat.jeton);
+    } catch (erreur) {
+      remplacer($('balayage-erreur'), bandeau('avertissement',
+        el('strong', null, 'La lecture s\'est interrompue. '), erreurLisible(erreur),
+        ' Vous pouvez reprendre là où elle s\'est arrêtée, ou analyser ce qui a déjà été lu.'));
+      montrer('bouton-reprendre', true);
+      return;
+    }
+    etat.complet = !etat.jeton;
+    await lireDrivesPartages();
+    analyser();
+  };
+
+  const lireDrivesPartages = async () => {
+    remplacer($('balayage-titre'), 'Lecture de vos Drives partagés…');
+    try {
+      const r = await socle.demander('rangementDrivesPartages');
+      etat.drives = r.drives;
+      etat.drivesIncomplet = !r.complet;
+      etat.drivesAbsorptions = r.absorptions;
+    } catch (erreur) {
+      etat.drives = [];
+      etat.drivesEchec = erreurLisible(erreur);
+    }
+  };
+
+  const commencer = () => {
+    Object.assign(etat, { elements: [], jeton: null, pages: 0, arret: false, complet: false });
+    montrer('ecran-accueil', false);
+    montrer('ecran-rapport', false);
+    montrer('ecran-balayage', true);
+    remplacer($('balayage-titre'), 'Lecture de votre Drive…');
+    majProgression();
+    lire();
+  };
+
+  /* ------------------------------------------------------------ analyse */
+
+  const analyser = () => {
+    etat.rapport = RangementAnalyse.analyser(etat.elements, etat.contexte, etat.contexte.reglages, etat.drives);
+    etat.ia.resultat = null;
+    montrer('ecran-balayage', false);
+    montrer('ecran-rapport', true);
+    afficherBandeaux();
+    afficherOnglets();
+    ouvrirOnglet(etat.onglet);
+  };
+
+  const afficherBandeaux = () => {
+    const bandeaux = [];
+    if (!etat.complet) {
+      bandeaux.push(bandeau('avertissement', el('strong', null, 'Analyse partielle. '),
+        `La lecture a été arrêtée après ${pluriel(etat.elements.length, 'élément', 'éléments')} : `
+        + 'des dossiers peuvent paraître vides ou orphelins parce que leur contenu n\'a pas été lu. ',
+        el('button', { classe: 's-bouton s-bouton--discret', onclick: () => {
+          etat.arret = false;
+          montrer('ecran-rapport', false);
+          montrer('ecran-balayage', true);
+          lire();
+        } }, 'Reprendre la lecture')));
+    }
+    const absorptions = [etat.contexte.absorptions, etat.drivesAbsorptions]
+      .filter(Boolean).flatMap((a) => a.causes || []);
+    if (absorptions.length) {
+      bandeaux.push(bandeau('avertissement', el('strong', null, 'Certaines données n\'ont pas pu être lues : '),
+        absorptions.map((c) => `${c.cause} (${c.occurrences})`).join(' ; '),
+        '. Les résultats qui en dépendent sont marqués « non mesuré ».'));
+    }
+    if (etat.drivesEchec) {
+      bandeaux.push(bandeau(null, 'Vos Drives partagés existants n\'ont pas pu être lus : les candidats ne sont '
+        + `rapprochés d'aucun Drive existant. (${etat.drivesEchec})`));
+    } else if (etat.drivesIncomplet) {
+      bandeaux.push(bandeau(null, 'Tous vos Drives partagés n\'ont pas pu être lus dans le temps imparti : '
+        + 'un Drive existant qui conviendrait peut manquer aux suggestions.'));
+    }
+    remplacer($('rapport-bandeaux'), bandeaux);
+  };
+
+  /* ------------------------------------------------------------ onglets */
+
+  const ONGLETS = [
+    ['synthese', 'Synthèse'],
+    ['drives', 'Drives partagés'],
+    ['constats', 'Constats'],
+    ['hierarchie', 'Hiérarchie proposée'],
+    ['ia', 'Proposition IA'],
+    ['reglages', 'Réglages'],
+    ['aide', 'Aide'],
+  ];
+
+  const afficherOnglets = () => {
+    const r = etat.rapport;
+    const compte = {
+      drives: r ? r.candidats.length : 0,
+      constats: r ? r.constats.length : 0,
+      hierarchie: r ? r.hierarchie.mouvements.length : 0,
+    };
+    remplacer($('onglets'), ONGLETS.map(([cle, libelle]) => el('button', {
+      role: 'tab', 'aria-selected': cle === etat.onglet ? 'true' : 'false',
+      onclick: () => ouvrirOnglet(cle),
+    }, compte[cle] ? `${libelle} (${nombre(compte[cle])})` : libelle)));
+  };
+
+  const ouvrirOnglet = (cle) => {
+    etat.onglet = cle;
+    if (!etat.rapport && !['aide', 'reglages'].includes(cle)) return;
+    if (etat.rapport) afficherOnglets();
+    if (!etat.rapport) {
+      montrer('ecran-accueil', false);
+      montrer('ecran-rapport', true);
+    }
+    const rendus = { synthese, drives, constats, hierarchie, ia, reglages, aide };
+    // Avant toute analyse, l'aide et les réglages s'ouvrent sans onglets : il
+    // faut un chemin de retour vers l'accueil.
+    const retour = etat.rapport ? null : el('div', null, el('button', {
+      classe: 's-bouton s-bouton--discret',
+      onclick: () => { montrer('ecran-rapport', false); montrer('ecran-accueil', true); },
+    }, '← Retour'));
+    remplacer($('contenu'), retour, rendus[cle]());
+    window.scrollTo(0, 0);
+  };
+
+  /* ------------------------------------------------------------ synthèse */
+
+  const chiffre = (valeur, libelle, source) => el('div', { classe: 's-chiffre' },
+    el('span', { classe: 's-chiffre__valeur' }, valeur),
+    el('span', { classe: 's-chiffre__libelle' }, libelle),
+    el('span', { classe: 's-chiffre__source' }, source));
+
+  const synthese = () => {
+    const r = etat.rapport;
+    const s = r.synthese;
+    const racine = (r.constats.find((c) => c.code === 'RACINE_ENCOMBREE') || { elements: [] }).elements.length;
+    const recommandes = r.candidats.filter((c) => c.niveau === 'recommande');
+    const note = r.indice.note;
+    const genre = note >= 80 ? 'bon' : (note >= 60 ? 'avertissement' : (note >= 40 ? 'serieux' : 'critique'));
+    const verdict = note >= 80 ? 'Bien rangé' : (note >= 60 ? 'Quelques piles à reprendre'
+      : (note >= 40 ? 'Le rangement a pris du retard' : 'Chambre d\'adolescent'));
+
+    return [
+      carte(
+        el('div', { classe: 's-rangee' },
+          el('span', { classe: 'r-note' }, `${note}`), el('span', { classe: 's-doux' }, '/ 100'),
+          el('span', { classe: `s-etat s-etat--${genre}` }, verdict)),
+        el('p', { classe: 's-legende' }, 'Indice de rangement : 100 moins les pénalités ci-dessous. '
+          + 'La note n\'est qu\'un résumé ; c\'est la liste qui se discute.'),
+        r.indice.penalites.length === 0 ? el('p', null, 'Aucune pénalité.')
+          : el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+            el('thead', null, el('tr', null, el('th', null, 'Pénalité'), el('th', null, 'Points'), el('th', null, 'Calcul'))),
+            el('tbody', null, r.indice.penalites.map((p) => el('tr', null,
+              el('td', null, p.libelle),
+              el('td', { classe: 's-nombre' }, `−${p.points} / ${p.maximum}`),
+              el('td', { classe: 's-legende' }, p.calcul))))))),
+      el('div', { classe: 's-grille' },
+        chiffre(nombre(s.arborescence), 'éléments dans Mon Drive', `sur ${nombre(s.elements)} lus ; ${pluriel(s.hors, 'autre, partagé', 'autres, partagés')} avec vous hors de votre arborescence, non analysés`),
+        chiffre(nombre(s.dossiers), 'dossiers', `profondeur maximale : ${s.profondeurMax} niveaux`),
+        chiffre(nombre(racine), 'fichiers à la racine', `au-delà de ${r.reglages.racineMax}, c'est signalé`),
+        chiffre(nombre(s.orphelin), 'éléments sans dossier', 'à vous, rangés nulle part'),
+        chiffre(nombre(recommandes.length), 'Drives partagés recommandés',
+          `score ≥ ${r.reglages.seuilDrivePartage} ; ${r.candidats.length - recommandes.length} autres à examiner`)),
+      carte(el('h2', { classe: 's-sous-titre' }, 'Par où commencer'),
+        premiersPas(r)),
+    ];
+  };
+
+  const premiersPas = (r) => {
+    const pas = [];
+    const recommandes = r.candidats.filter((c) => c.niveau === 'recommande');
+    if (recommandes.length) {
+      pas.push(el('li', null, el('strong', null, 'Sécuriser le travail d\'équipe. '),
+        `${pluriel(recommandes.length, 'dossier sert', 'dossiers servent')} surtout à d'autres que vous. `,
+        el('a', { href: '#', onclick: (e) => { e.preventDefault(); ouvrirOnglet('drives'); } }, 'Voir les Drives partagés proposés.')));
+    }
+    const graves = r.constats.filter((c) => c.gravite === 'critique' || c.gravite === 'serieux');
+    graves.slice(0, 3).forEach((c) => pas.push(el('li', null, el('strong', null, `${c.titre}. `), c.conseil)));
+    if (!pas.length) pas.push(el('li', null, 'Rien d\'urgent. Les suggestions de l\'onglet « Constats » sont des améliorations de confort.'));
+    return el('ol', null, pas);
+  };
+
+  /* ------------------------------------------------------------ Drives partagés */
+
+  const tableauDetail = (detail) => el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+    el('thead', null, el('tr', null, el('th', null, 'Signal'), el('th', null, 'Points'), el('th', null, 'Ce qui a été mesuré'))),
+    el('tbody', null, detail.map((d) => el('tr', null,
+      el('td', null, d.signal),
+      el('td', { classe: 's-nombre' }, d.points > 0 ? `+${d.points}` : `${d.points}`),
+      el('td', { classe: d.texte.startsWith('non mesuré') ? 's-non-mesure' : 's-legende' }, d.texte))))));
+
+  const drives = () => {
+    const r = etat.rapport;
+    if (!r.candidats.length) {
+      return [carte(el('p', null, 'Aucun dossier de Mon Drive ne ressemble à un dossier d\'équipe, '
+        + `au seuil de ${r.reglages.seuilAExaminer} points.`),
+      el('p', { classe: 's-legende' }, 'Le seuil se règle dans l\'onglet « Réglages ».'))];
+    }
+    const parId = new Map(r.candidats.map((c) => [c.id, c]));
+    return [
+      carte(el('h2', { classe: 's-sous-titre' }, 'Pourquoi un Drive partagé'),
+        el('p', null, 'Dans Mon Drive, un dossier appartient à une personne. Dans un Drive partagé, il appartient à '
+          + 'l\'organisation : il survit au départ de qui l\'a créé, et ses membres se gèrent en un seul endroit.'),
+        el('p', { classe: 's-legende' }, 'Ce que Google fait au déplacement, d\'après son aide : la propriété passe à '
+          + 'l\'organisation ; les anciens éditeurs deviennent « gestionnaires de contenu » ; tous les membres du '
+          + 'Drive partagé voient tout son contenu ; une personne qui n\'avait accès que par un dossier parent peut '
+          + 'perdre l\'accès. Il faut être gestionnaire du Drive partagé pour y déplacer un dossier.')),
+      r.cercles.map((cercle) => carte(
+        el('div', { classe: 'r-entete' },
+          el('h2', { classe: 's-sous-titre' }, `Drive partagé proposé : « ${cercle.nomPropose} »`),
+          el('span', { classe: 's-legende' }, `nom tiré de : ${cercle.origineNom}`)),
+        cercle.drivesExistants.length
+          ? bandeau('bon', 'Un Drive partagé existe déjà avec ces personnes : ',
+            cercle.drivesExistants.map((d, i) => [i ? ', ' : '', el('a', {
+              href: `https://drive.google.com/drive/folders/${encodeURIComponent(d.id)}`, target: '_blank', rel: 'noopener',
+            }, d.nom), ` (${Math.round(d.proximite * 100)} % de membres en commun)`]),
+            '. Mieux vaut y ranger ces dossiers que d\'en créer un nouveau.')
+          : null,
+        cercle.membres.length
+          ? el('p', null, el('strong', null, 'Membres proposés : '), 'vous (gestionnaire), ',
+            cercle.membres.map((m, i) => `${i ? ', ' : ''}${m.adresse}${m.groupe ? ' (groupe)' : ''} — ${m.roleDrive.toLowerCase()}`))
+          : el('p', { classe: 's-non-mesure' }, 'Membres non mesurés : les partages de ces dossiers n\'ont pas été rendus par Google.'),
+        cercle.dossiers.map((id) => blocCandidat(parId.get(id))))),
+    ];
+  };
+
+  const blocCandidat = (c) => el('div', { classe: 's-pile', style: 'border-top: 1px solid var(--s-bordure); padding-top: var(--s-pas-3)' },
+    el('div', { classe: 's-rangee' },
+      el('strong', null, lienDrive({ id: c.id, genre: 'dossier', chemin: c.chemin })),
+      el('span', { classe: `s-etat s-etat--${c.niveau === 'recommande' ? 'serieux' : 'avertissement'}` },
+        `${c.score}/100 — ${c.niveau === 'recommande' ? 'recommandé' : 'à examiner'}`),
+      el('span', { classe: 's-legende' }, `${pluriel(c.fichiers, 'fichier', 'fichiers')}, ${pluriel(c.dossiers, 'sous-dossier', 'sous-dossiers')}, ${taille(c.octets)}`)),
+    c.obstacles.map((o) => bandeau(o.bloquant ? 'critique' : 'avertissement', o.texte)),
+    c.externes.length ? el('p', { classe: 's-legende' }, `Partagé aussi avec ${pluriel(c.externes.length, 'personne extérieure', 'personnes extérieures')} : `
+      + `${c.externes.slice(0, 5).join(', ')}${c.externes.length > 5 ? '…' : ''}. Vérifiez que votre organisation autorise les externes dans les Drives partagés.`) : null,
+    c.partageLarge ? el('p', { classe: 's-legende' }, 'Partagé aussi par lien ou avec tout le domaine : ce partage ne se transporte pas tel quel, à revoir après le déplacement.') : null,
+    c.sousDossiersAussiCandidats ? el('p', { classe: 's-legende' },
+      `Inclut ${pluriel(c.sousDossiersAussiCandidats, 'sous-dossier qui serait', 'sous-dossiers qui seraient')} aussi candidat : ils partent avec lui.`) : null,
+    c.contributeurs.length ? el('p', { classe: 's-legende' }, 'Principaux auteurs des dernières modifications : ',
+      c.contributeurs.map((x) => `${x.adresse} (${x.modifications})`).join(', ')) : null,
+    el('details', { classe: 'r-detail' }, el('summary', null, 'Détail du score'), tableauDetail(c.detail)));
+
+  /* ------------------------------------------------------------ constats */
+
+  const MAX_LISTE = 200;
+
+  const listeElements = (elements) => (elements.length ? el('details', { classe: 'r-detail' },
+    el('summary', null, `Voir ${pluriel(elements.length, 'élément', 'éléments')}`),
+    el('ul', null, elements.slice(0, MAX_LISTE).map((o) => el('li', null, lienDrive(o)))),
+    elements.length > MAX_LISTE ? el('p', { classe: 's-legende' },
+      `… et ${nombre(elements.length - MAX_LISTE)} autres, non affichés ici : l'export CSV les contient tous.`) : null) : null);
+
+  const constats = () => {
+    const r = etat.rapport;
+    const filtres = ['tous', 'critique', 'serieux', 'avertissement', 'neutre'];
+    const retenus = r.constats.filter((c) => etat.filtreGravite === 'tous' || c.gravite === etat.filtreGravite);
+    return [
+      el('div', { classe: 's-rangee' },
+        filtres.map((f) => el('button', {
+          classe: `s-bouton${etat.filtreGravite === f ? ' s-bouton--primaire' : ''}`,
+          onclick: () => { etat.filtreGravite = f; ouvrirOnglet('constats'); },
+        }, f === 'tous' ? `Tous (${r.constats.length})`
+          : `${ETIQUETTES_GRAVITE[f]} (${r.constats.filter((c) => c.gravite === f).length})`)),
+        el('button', { classe: 's-bouton s-bouton--discret', onclick: exporterConstats }, 'Exporter en CSV')),
+      retenus.length === 0 ? carte(el('p', null, 'Rien à signaler dans cette catégorie.')) : null,
+      retenus.slice(0, 300).map((c) => carte(
+        el('div', { classe: 's-rangee' }, badgeGravite(c.gravite), badgeCertitude(c.certitude), el('strong', null, c.titre)),
+        c.objet ? el('p', null, lienDrive(c.objet)) : null,
+        el('p', null, c.explication),
+        el('p', { classe: 's-legende' }, el('strong', null, 'Calcul : '), c.calcul),
+        el('p', null, el('strong', null, 'Que faire : '), c.conseil),
+        listeElements(c.elements))),
+      retenus.length > 300 ? el('p', { classe: 's-legende' }, `${nombre(retenus.length - 300)} constats de plus, `
+        + 'non affichés : filtrez par gravité, ou exportez-les en CSV.') : null,
+    ];
+  };
+
+  /* ------------------------------------------------------------ hiérarchie */
+
+  const ACTIONS = {
+    drive_partage: 'Vers un Drive partagé',
+    archiver: 'Archiver',
+    regrouper: 'Regrouper',
+    ranger: 'Ranger',
+    rattacher: 'Rattacher',
+    aplatir: 'Supprimer un niveau',
+    fusionner: 'Fusionner',
+  };
+
+  const hierarchie = () => {
+    const h = etat.rapport.hierarchie;
+    const mouvements = h.mouvements.filter((m) => etat.filtreAction === 'tous' || m.action === etat.filtreAction);
+    return [
+      carte(el('h2', { classe: 's-sous-titre' }, 'L\'arborescence qui en résulterait'),
+        el('p', { classe: 's-legende' }, 'Premier niveau seulement. En italique, les dossiers à créer. '
+          + 'Rien n\'est appliqué : c\'est un plan à relire, et les déplacements se font dans Drive.'),
+        el('ul', { classe: 'r-arbre' },
+          el('li', null, el('strong', null, 'Mon Drive'), el('ul', null,
+            h.monDrive.map((n) => el('li', { classe: n.genre === 'nouveau' ? 'r-nouveau' : '' },
+              el('span', { classe: 'r-nom' }, n.nom), ' ', el('span', { classe: 's-legende' }, `(${nombre(n.entrees)})`),
+              n.sous.length ? el('ul', null, n.sous.map((x) => el('li', { classe: 'r-nouveau' },
+                el('span', { classe: 'r-nom' }, x.nom), ' ', el('span', { classe: 's-legende' }, `(${nombre(x.entrees)})`)))) : null)))),
+          h.drivesPartages.map((d) => el('li', { classe: 'r-drive' },
+            el('strong', null, d.nom), ' ', el('span', { classe: 's-legende' }, `(${pluriel(d.dossiers, 'dossier', 'dossiers')})`))))),
+      el('div', { classe: 's-rangee' },
+        ['tous', ...Object.keys(ACTIONS)].filter((a) => a === 'tous' || h.mouvements.some((m) => m.action === a))
+          .map((a) => el('button', {
+            classe: `s-bouton${etat.filtreAction === a ? ' s-bouton--primaire' : ''}`,
+            onclick: () => { etat.filtreAction = a; ouvrirOnglet('hierarchie'); },
+          }, a === 'tous' ? `Tous (${h.mouvements.length})`
+            : `${ACTIONS[a]} (${h.mouvements.filter((m) => m.action === a).length})`)),
+        el('button', { classe: 's-bouton s-bouton--discret', onclick: exporterMouvements }, 'Exporter en CSV')),
+      el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+        el('thead', null, el('tr', null, ['Action', 'Élément', 'Destination', 'Pourquoi', 'Certitude'].map((t) => el('th', null, t)))),
+        el('tbody', null, mouvements.slice(0, 500).map((m) => el('tr', null,
+          el('td', null, ACTIONS[m.action] || m.action),
+          el('td', null, lienDrive({ id: m.source.id, genre: ['drive_partage', 'archiver', 'regrouper', 'aplatir', 'fusionner'].includes(m.action) ? 'dossier' : 'fichier', chemin: m.source.chemin })),
+          el('td', null, m.destination),
+          el('td', { classe: 's-legende' }, m.raison),
+          el('td', null, badgeCertitude(m.certitude))))))),
+      mouvements.length > 500 ? el('p', { classe: 's-legende' },
+        `${nombre(mouvements.length - 500)} mouvements de plus, non affichés : l'export CSV les contient tous.`) : null,
+    ];
+  };
+
+  /* ------------------------------------------------------------ IA */
+
+  const ia = () => {
+    const infos = etat.contexte.ia;
+    if (!infos.disponible) {
+      return [carte(el('h2', { classe: 's-sous-titre' }, 'Proposition par l\'IA : non activée'),
+        el('p', null, 'Votre organisation n\'a pas activé cette option. Les propositions de l\'onglet '
+          + '« Hiérarchie proposée » ne dépendent pas de l\'IA et restent complètes.'),
+        el('p', { classe: 's-legende' }, 'Pour l\'activer, l\'administrateur de l\'outil pose une clé d\'API '
+          + 'Gemini (voir le guide de démarrage).'))];
+    }
+    const resume = RangementAnalyse.resumePourIa(etat.rapport, etat.ia.taille);
+    etat.ia.resume = resume;
+    const envoi = JSON.stringify(resume.envoi, null, 2);
+    const blocs = [
+      carte(el('h2', { classe: 's-sous-titre' }, 'Demander une arborescence à l\'IA'),
+        el('p', null, 'L\'IA (Gemini, de Google) lit la liste de vos dossiers et propose une arborescence nommée. '
+          + 'Elle voit ce que les règles de l\'outil ne voient pas : que « Propales », « Offres 2023 » et « Devis » '
+          + 'parlent de la même chose.'),
+        bandeau('avertissement', el('strong', null, 'Ce qui partira : '),
+          `les chemins de ${pluriel(resume.envoi.dossiers.length, 'dossier', 'dossiers')} et quelques compteurs. `
+          + 'Aucun nom de fichier, aucune adresse, aucun identifiant Drive. ',
+          resume.tronque ? `Votre Drive compte ${nombre(resume.total)} dossiers : seuls les ${resume.envoi.dossiers.length} `
+            + 'plus hauts et plus fournis sont envoyés. ' : '',
+          'Un nom de dossier peut être en lui-même une information sensible (« Licenciement Dupont ») : relisez l\'envoi.'),
+        el('div', { classe: 's-rangee' },
+          el('label', { classe: 's-champ' }, el('span', { classe: 's-champ__libelle' }, 'Dossiers envoyés, au plus'),
+            el('select', { classe: 's-champ__saisie', onchange: (e) => { etat.ia.taille = Number(e.target.value); etat.ia.consentement = false; ouvrirOnglet('ia'); } },
+              [50, 100, 200, 400].filter((n) => n <= infos.dossiersMax).map((n) => el('option', { value: n, selected: n === etat.ia.taille }, String(n)))))),
+        el('details', { classe: 'r-detail' }, el('summary', null, 'Voir exactement ce qui sera envoyé'),
+          el('pre', { classe: 'r-apercu' }, envoi)),
+        el('label', { classe: 's-rangee' },
+          el('input', { type: 'checkbox', checked: etat.ia.consentement, onchange: (e) => { etat.ia.consentement = e.target.checked; ouvrirOnglet('ia'); } }),
+          'J\'ai vu ce qui sera envoyé et j\'accepte de l\'envoyer à l\'API Gemini de Google.'),
+        el('div', { classe: 's-rangee' },
+          el('button', {
+            classe: 's-bouton s-bouton--primaire',
+            disabled: !etat.ia.consentement || etat.ia.enCours || infos.restantAujourdhui < 1,
+            onclick: demanderIa,
+          }, etat.ia.enCours ? 'Proposition en cours… (jusqu\'à une minute)' : 'Demander une proposition'),
+          el('span', { classe: 's-legende' }, `${pluriel(infos.restantAujourdhui, 'demande restante', 'demandes restantes')} aujourd'hui sur ${infos.quotaJour}.`)),
+        etat.ia.erreur ? bandeau('critique', etat.ia.erreur) : null),
+    ];
+    if (etat.ia.resultat) blocs.push(resultatIa(etat.ia.resultat));
+    return blocs;
+  };
+
+  const demanderIa = async () => {
+    etat.ia.enCours = true;
+    etat.ia.erreur = '';
+    const resume = etat.ia.resume;
+    ouvrirOnglet('ia');
+    try {
+      etat.ia.resultat = { ...(await socle.demander('rangementProposerIa', [resume.envoi])), table: resume.table };
+      // Le consentement valait pour cet envoi-là : le suivant se redemande.
+      etat.ia.consentement = false;
+    } catch (erreur) {
+      etat.ia.erreur = erreurLisible(erreur);
+    }
+    etat.contexte.ia.restantAujourdhui = Math.max(0, etat.contexte.ia.restantAujourdhui - 1);
+    etat.ia.enCours = false;
+    ouvrirOnglet('ia');
+  };
+
+  const ROLES_IA = { mon_drive: '', drive_partage: 'Drive partagé', archive: 'archives', personnel: 'personnel', a_trier: 'à trier' };
+
+  const resultatIa = (res) => {
+    const arbre = etat.rapport.interne.arbre;
+    const enfants = new Map();
+    res.noeuds.forEach((n) => {
+      if (!enfants.has(n.parent)) enfants.set(n.parent, []);
+      enfants.get(n.parent).push(n);
+    });
+    const origine = (ref) => {
+      const id = res.table.get(ref);
+      const d = id && arbre.parId.get(id);
+      return d ? el('li', null, lienDrive({ id: d.id, genre: 'dossier', chemin: arbre.chemin(d) })) : null;
+    };
+    const branche = (parent) => (enfants.get(parent) || []).map((n) => el('li', { classe: n.role === 'drive_partage' ? 'r-drive' : '' },
+      el('strong', null, n.nom), ROLES_IA[n.role] ? el('span', { classe: 's-legende' }, ` — ${ROLES_IA[n.role]}`) : null,
+      el('div', { classe: 's-legende' }, n.justification),
+      n.origines.length ? el('details', { classe: 'r-detail' }, el('summary', null, `${pluriel(n.origines.length, 'dossier actuel', 'dossiers actuels')}`),
+        el('ul', null, n.origines.map(origine))) : null,
+      enfants.has(n.ref) ? el('ul', null, branche(n.ref)) : null));
+    const ecarts = res.ecartes.referencesInventees + res.ecartes.referencesEnDouble + res.ecartes.noeudsInvalides;
+    return carte(
+      el('div', { classe: 's-rangee' }, el('h2', { classe: 's-sous-titre' }, 'Proposition de l\'IA'),
+        el('span', { classe: 's-etat s-etat--neutre' }, 'non vérifiée par l\'outil')),
+      el('p', { classe: 's-legende' }, `Modèle demandé : ${res.modeleDemande}`,
+        res.modele && res.modele !== res.modeleDemande ? ` ; version servie : ${res.modele}` : ''),
+      res.principes.length ? el('ul', null, res.principes.map((p) => el('li', null, p))) : null,
+      el('ul', { classe: 'r-arbre' }, branche('')),
+      ecarts ? bandeau('avertissement', `${pluriel(ecarts, 'élément écarté', 'éléments écartés')} de la réponse : `
+        + `${res.ecartes.referencesInventees} références de dossier inventées, ${res.ecartes.referencesEnDouble} en double, `
+        + `${res.ecartes.noeudsInvalides} nœuds invalides.`) : null,
+      res.nonPlaces.length ? el('p', { classe: 's-legende' }, `${pluriel(res.nonPlaces.length, 'dossier envoyé n\'a', 'dossiers envoyés n\'ont')} été placé nulle part par l'IA.`) : null);
+  };
+
+  /* ------------------------------------------------------------ réglages */
+
+  const CHAMPS_REGLAGES = [
+    ['racineMax', 'Fichiers tolérés à la racine', 'Au-delà, la racine est signalée comme encombrée.'],
+    ['profondeurMax', 'Profondeur maximale', 'Nombre de niveaux de dossiers sous « Mon Drive » avant signalement.'],
+    ['fourreToutMin', 'Taille d\'un fourre-tout', 'Fichiers directement dans un même dossier à partir desquels il est signalé.'],
+    ['dormantAnnees', 'Années sans modification', 'Une branche intouchée depuis ce nombre d\'années est proposée aux archives.'],
+    ['seuilDrivePartage', 'Score « Drive partagé recommandé »', 'Sur 100. Voir l\'aide pour le calcul du score.'],
+    ['seuilAExaminer', 'Score « à examiner »', 'Sur 100, et au plus égal au précédent.'],
+  ];
+
+  const reglages = () => {
+    const r = etat.contexte.reglages;
+    const formulaire = el('form', { classe: 's-pile', onsubmit: (e) => { e.preventDefault(); enregistrer(e.target); } },
+      el('div', { classe: 'r-champs' }, CHAMPS_REGLAGES.map(([cle, libelle, aide]) => el('label', { classe: 's-champ' },
+        el('span', { classe: 's-champ__libelle' }, libelle),
+        el('input', { classe: 's-champ__saisie', type: 'number', name: cle, value: r[cle], required: true }),
+        el('span', { classe: 's-champ__aide' }, `${aide} Par défaut : ${etat.contexte.reglagesParDefaut[cle]}.`)))),
+      el('label', { classe: 's-champ' },
+        el('span', { classe: 's-champ__libelle' }, 'Mots qui signalent un dossier personnel'),
+        el('textarea', { classe: 's-champ__saisie', name: 'motsPersonnels', rows: 3 }, r.motsPersonnels),
+        el('span', { classe: 's-champ__aide' }, 'Séparés par des virgules. Un dossier dont le nom contient l\'un d\'eux n\'est jamais proposé pour un Drive partagé.')),
+      el('div', { id: 'reglages-message' }),
+      el('div', { classe: 's-rangee' },
+        el('button', { classe: 's-bouton s-bouton--primaire', type: 'submit' }, 'Enregistrer et réanalyser'),
+        el('button', { classe: 's-bouton s-bouton--discret', type: 'button', onclick: reinitialiser }, 'Revenir aux valeurs par défaut')));
+    return [carte(el('h2', { classe: 's-sous-titre' }, 'Vos réglages'),
+      el('p', { classe: 's-legende' }, 'Ils ne valent que pour vous. Les changer relance l\'analyse sans relire votre Drive.'),
+      formulaire)];
+  };
+
+  const appliquerReglages = (nouveaux, message) => {
+    etat.contexte.reglages = nouveaux;
+    if (etat.rapport) {
+      etat.rapport = RangementAnalyse.analyser(etat.elements, etat.contexte, nouveaux, etat.drives);
+      afficherOnglets();
+    }
+    ouvrirOnglet('reglages');
+    remplacer($('reglages-message'), bandeau('bon', message));
+  };
+
+  const enregistrer = async (formulaire) => {
+    const donnees = Object.fromEntries(new FormData(formulaire).entries());
+    try {
+      appliquerReglages(await socle.demander('rangementEnregistrerReglages', [donnees]), 'Réglages enregistrés, analyse mise à jour.');
+    } catch (erreur) {
+      remplacer($('reglages-message'), bandeau('critique', erreurLisible(erreur)));
+    }
+  };
+
+  const reinitialiser = async () => {
+    try {
+      appliquerReglages(await socle.demander('rangementReinitialiserReglages'), 'Valeurs par défaut rétablies.');
+    } catch (erreur) {
+      remplacer($('reglages-message'), bandeau('critique', erreurLisible(erreur)));
+    }
+  };
+
+  /* ------------------------------------------------------------ aide */
+
+  const AIDE_CONSTATS = [
+    ['Racine encombrée', 'Fichiers posés directement sous « Mon Drive », au-delà du seuil réglé.'],
+    ['Éléments sans dossier', 'À vous, sans aucun dossier parent : on ne les retrouve que par la recherche (« is:unorganized owner:me » dans Drive).'],
+    ['Profondeur', 'Premier dossier qui dépasse la profondeur réglée, une fois par branche.'],
+    ['Fourre-tout', 'Dossier qui contient directement plus de fichiers que le seuil réglé.'],
+    ['Dossier vide, niveau inutile', 'Un dossier sans rien, ou qui ne contient qu\'un seul dossier.'],
+    ['Dossiers homonymes', 'Même nom à des endroits différents. « Client A / Factures » et « Client B / Factures » ne sont pas signalés : c\'est une structure régulière. Présomption.'],
+    ['Copies, sans titre', '« Copie de… », « (1) », « Sans titre », « Nouveau dossier ».'],
+    ['Doublons probables', 'Même nom une fois retirées les marques de copie et de version, même type, même taille. Le contenu n\'est pas lu : présomption.'],
+    ['Versions manuelles', '« v2 », « final », « relu »… pour des fichiers d\'un même dossier. Drive garde déjà l\'historique des versions.'],
+    ['Dates mélangées', 'Noms d\'un même dossier qui écrivent les dates de plusieurs façons. Seul « aaaa-mm-jj » se trie.'],
+    ['Branche dormante', 'Le plus haut dossier dont tout le contenu est intouché depuis le nombre d\'années réglé.'],
+  ];
+
+  const aide = () => {
+    const c = etat.contexte;
+    return [
+      carte(el('h2', { classe: 's-sous-titre' }, 'Ce que l\'outil lit, et ce qu\'il ne fait pas'),
+        el('ul', null,
+          el('li', null, 'Il lit les métadonnées de Mon Drive et de « Partagés avec moi » : noms, dossiers, dates, propriétaires, partages. Jamais le contenu.'),
+          el('li', null, 'Il ne modifie rien : son autorisation Google est en lecture seule. Les rangements, c\'est vous qui les faites.'),
+          el('li', null, 'L\'analyse tourne dans votre navigateur. Rien n\'est conservé après la fermeture de la page, sauf vos réglages.'),
+          el('li', null, 'Les éléments partagés avec vous mais hors de votre arborescence sont lus puis mis de côté : ce n\'est pas à vous de les ranger.'))),
+      carte(el('h2', { classe: 's-sous-titre' }, 'Le score « Drive partagé »'),
+        el('p', null, 'Un dossier de Mon Drive dont d\'autres sont les principaux auteurs est un dossier d\'équipe hébergé chez une personne. Quatre signaux, chacun plafonné :'),
+        el('ul', null,
+          el('li', null, 'collègues en écriture sur le dossier : 10 points chacun, 30 au plus (un groupe compte pour 3) ;'),
+          el('li', null, 'part des fichiers modifiés en dernier par quelqu\'un d\'autre : jusqu\'à 30 points ;'),
+          el('li', null, 'part des fichiers appartenant à quelqu\'un d\'autre : jusqu\'à 20 points ;'),
+          el('li', null, 'activité : 20 points si modifié dans les 90 jours, 10 dans l\'année.')),
+        el('p', null, 'Un dossier dont le nom évoque la vie privée (réglable) est ramené à zéro. Seuls les collègues de vos domaines comptent : ',
+          el('strong', null, (c.domainesInternes || []).join(', ') || 'aucun domaine connu'), '.'),
+        el('p', { classe: 's-legende' }, 'Obstacles signalés, d\'après l\'aide de Google : le déplacement est refusé si 25 éléments ou 10 % du contenu appartiennent à des personnes extérieures, au-delà de 100 000 éléments, ou au-delà de 20 niveaux de dossiers.')),
+      carte(el('h2', { classe: 's-sous-titre' }, 'Les constats'),
+        el('p', null, el('strong', null, 'fait'), ' : constaté dans les données de Drive. ',
+          el('strong', null, 'présomption'), ' : déduit par l\'outil, peut être faux, à vérifier. Une valeur « non mesurée » n\'est jamais comptée comme zéro.'),
+        el('dl', null, AIDE_CONSTATS.map(([t, d]) => [el('dt', null, el('strong', null, t)), el('dd', null, d)]))),
+      carte(el('h2', { classe: 's-sous-titre' }, 'À propos'),
+        el('p', null, `Rangement Drive (drive-organizer-gas), version ${c.version}. Licence Elastic 2.0.`),
+        el('p', null, 'Développé par ', el('a', { href: 'https://faucheux.bzh', target: '_blank', rel: 'noopener' }, 'Fabrice Faucheux'), ' · ', el('a', { href: 'https://github.com/FabriceFx/drive-organizer-gas', target: '_blank', rel: 'noopener' }, 'Code source sur GitHub')),
+        el('p', { classe: 's-legende' }, 'Un problème ? Transmettez à l\'administrateur de l\'outil le message d\'erreur, avec sa référence horodatée.')),
+    ];
+  };
+
+  /* ------------------------------------------------------------ exports */
+
+  const telecharger = (nom, lignes) => {
+    const lien = el('a', {
+      href: URL.createObjectURL(new Blob([RangementAnalyse.csv(lignes)], { type: 'text/csv;charset=utf-8' })),
+      download: nom,
+    });
+    document.body.append(lien);
+    lien.click();
+    setTimeout(() => { URL.revokeObjectURL(lien.href); lien.remove(); }, 1000);
+  };
+
+  const exporterConstats = () => {
+    const lignes = [['Code', 'Gravité', 'Certitude', 'Constat', 'Objet', 'Élément', 'Lien', 'Calcul']];
+    etat.rapport.constats.forEach((c) => {
+      const cibles = c.elements.length ? c.elements : [c.objet || {}];
+      cibles.forEach((o) => lignes.push([c.code, c.gravite, c.certitude, c.titre, c.objet ? c.objet.chemin : '',
+        o.chemin || '', o.id ? urlDrive(o.id, o.genre) : '', c.calcul]));
+    });
+    telecharger(`constats-drive-${etat.contexte.aujourdhui}.csv`, lignes);
+  };
+
+  const exporterMouvements = () => {
+    const lignes = [['Action', 'Élément', 'Lien', 'Destination', 'Pourquoi', 'Certitude']];
+    etat.rapport.hierarchie.mouvements.forEach((m) => lignes.push([ACTIONS[m.action] || m.action, m.source.chemin,
+      urlDrive(m.source.id, 'fichier'), m.destination, m.raison, m.certitude]));
+    telecharger(`plan-rangement-drive-${etat.contexte.aujourdhui}.csv`, lignes);
+  };
+
+  /* ------------------------------------------------------------ branchements */
+
+  $('bouton-analyser').addEventListener('click', commencer);
+  $('bouton-arreter').addEventListener('click', () => {
+    etat.arret = true;
+    remplacer($('balayage-titre'), 'Arrêt après la page en cours…');
+  });
+  $('bouton-reprendre').addEventListener('click', () => { etat.arret = false; lire(); });
+
+  demarrer();
+})();
+</script>

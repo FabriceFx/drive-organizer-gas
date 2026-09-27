@@ -1,0 +1,93 @@
+# Démarrage
+
+Pour l'administrateur qui déploie. Comptez dix minutes. Les utilisateurs, eux,
+n'ont qu'une URL à ouvrir.
+
+Prérequis : un compte de votre domaine Google Workspace. Aucun droit
+d'administration n'est nécessaire : chacun n'analyse que son propre Drive.
+
+## 1. Créer le projet
+
+**Avec clasp** (depuis ce dossier) :
+
+```bash
+clasp create --type standalone --title "Rangement Drive" --rootDir apps-script
+```
+
+```bash
+clasp push
+```
+
+Vérifiez ensuite, dans l'éditeur, que le fuseau du projet est **Europe/Paris** :
+`clasp create` pose celui du compte Google, pas le vôtre.
+
+**À la main** :
+
+1. Ouvrez [script.new](https://script.new), nommez le projet « Rangement Drive ».
+2. **Paramètres du projet** : cochez « Afficher le fichier manifeste », puis collez `appsscript.json`.
+3. Supprimez `Code.gs`, puis recréez chaque fichier de `apps-script/` sous le même nom :
+
+   | Fichiers | Bouton de l'éditeur |
+   |---|---|
+   | `*.gs` | **+ > Script** (sans l'extension dans le nom) |
+   | `*.html` | **+ > HTML** (sans l'extension dans le nom) |
+
+> ⚠️ Du HTML collé dans un fichier de script empêche **tout** le projet de se charger :
+> toutes les fonctions deviennent « introuvables », y compris celles qui n'ont rien à voir.
+
+## 2. Déclarer vos domaines secondaires (si vous en avez)
+
+Le domaine de chaque utilisateur est reconnu automatiquement. Pour les domaines
+secondaires et alias, exécutez une fois depuis l'éditeur :
+
+```js
+rangementDefinirDomainesInternes('filiale.fr, ancienne-marque.com')
+```
+
+Sans cela, un collègue sur un domaine secondaire passe pour un externe : il ne
+compte pas dans le score, et ses fichiers passent pour des fichiers que Google
+refusera de déplacer.
+
+## 3. Déployer
+
+**Déployer > Nouveau déploiement > Application Web** :
+
+| Champ | Valeur |
+|---|---|
+| Exécuter en tant que | **L'utilisateur qui accède à l'application Web** |
+| Qui a accès | **Tous les utilisateurs de votre domaine** |
+
+Ouvrez l'URL `/exec`, autorisez, lancez une analyse sur votre propre Drive. Puis diffusez l'URL.
+
+## 4. Activer l'option IA (facultatif)
+
+1. Créez une clé sur [aistudio.google.com](https://aistudio.google.com) (rubrique *API keys*), dans un projet Google Cloud **dont la facturation est activée**.
+
+   > ⚠️ **Pas de clé du niveau gratuit.** D'après les [conditions de l'API Gemini](https://ai.google.dev/gemini-api/terms), Google se sert des requêtes gratuites pour améliorer ses produits, et des personnes peuvent les relire. Sur le niveau payant, il ne les conserve que le temps de détecter les abus. Des noms de dossiers d'entreprise relèvent du second cas. L'outil ne peut pas vérifier le niveau de la clé : c'est à vous.
+
+   Restreignez la clé à la seule *Generative Language API* (console Google Cloud > Identifiants). C'est l'organisation qui paie : 5 demandes au plus par personne et par jour.
+2. **Paramètres du projet > Propriétés du script > Ajouter** : nom `RANGEMENT_CLE_GEMINI`, valeur la clé.
+
+   Passez par cet écran plutôt que par le code : une clé tapée dans un fichier finit dans l'historique des versions, lisible par tout éditeur du projet.
+
+3. Rechargez l'application : l'onglet « Proposition IA » propose l'envoi.
+
+Pour désactiver : supprimez la propriété, ou exécutez `rangementDefinirCleIa('')`.
+
+## 5. Mettre à jour
+
+Après un `clasp push` ou une modification : **Gérer les déploiements > modifier > Version : nouvelle version**.
+
+L'URL `/exec` sert la version déployée, figée ; l'URL `/dev` sert le code courant. Si
+l'une marche et pas l'autre, c'est qu'il manque ce redéploiement. Le pied de page de
+l'application affiche le numéro de version qui tourne.
+
+## En cas de souci
+
+| Situation | Que faire |
+|---|---|
+| « Fonction de script introuvable » | Redéployez une nouvelle version (ci-dessus). Si rien ne marche, même dans `/dev`, un fichier ne se charge pas : vérifiez qu'aucun HTML n'a été collé dans un `.gs`. |
+| La lecture s'interrompt | Le bouton « Reprendre la lecture » repart de la dernière page lue. |
+| Analyse arrêtée en cours | Un bandeau le dit : des dossiers peuvent paraître vides ou orphelins faute d'avoir été lus. |
+| Bandeau « certaines données n'ont pas pu être lues » | Les résultats qui en dépendent sont marqués « non mesuré ». Relancez plus tard. |
+| Erreur « imprévue » avec une référence | Cherchez l'heure de la référence dans **Exécutions** de l'éditeur : le détail technique y est. |

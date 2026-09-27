@@ -125,6 +125,16 @@ const fauxServeur = `
     rangementDrivesPartages: () => ({ drives: DRIVES, complet: true, absorptions: { total: 0, causes: [] } }),
     rangementEnregistrerReglages: (r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, k === 'motsPersonnels' ? v : Number(v)])),
     rangementReinitialiserReglages: () => CONTEXTE.reglagesParDefaut,
+    rangementPreparerPlan: () => {
+      PLAN.plan = { id: 'plan-demo', url: 'https://docs.google.com/spreadsheets/d/plan-demo/edit', cree: '2026-09-27 20:10:00' };
+      PLAN.restant = 31; PLAN.coche = true;   // l'aperçu fait comme si tout avait été coché dans Sheets
+      return { ...PLAN.plan, lignes: 38, manuels: 2 };
+    },
+    rangementEtatPlan: () => etatPlan(),
+    rangementLancerApplication: () => { PLAN.restant = 20; return { traitees: 11, restant: 20 }; },
+    rangementPoursuivreApplication: () => { PLAN.restant = Math.max(0, PLAN.restant - 10); return { traitees: 10, restant: PLAN.restant }; },
+    rangementArreterApplication: () => ({ arrete: true }),
+    rangementVerifierDeplacements: () => { PLAN.verifie = true; return { verifies: 2, deplaces: 1 }; },
     rangementProposerIa: (resume) => ({
       principes: ['Aperçu local : proposition fictive, aucun appel n\\'est fait.'],
       noeuds: [
@@ -136,6 +146,18 @@ const fauxServeur = `
       nonPlaces: [], modeleDemande: 'gemini-3.8-flash', modele: 'gemini-3.8-flash', jetons: null,
     }),
   };
+  // Plan simulé : trois passages pour aller au bout, un dossier à déplacer à la main.
+  const PLAN = { plan: null, restant: 0, total: 0, coche: false, verifie: false };
+  const etatPlan = () => (!PLAN.plan ? { plan: null } : {
+    plan: PLAN.plan, lignes: 38, validees: PLAN.coche ? 38 : 0, aTraiter: PLAN.coche ? PLAN.restant : 0,
+    parAction: PLAN.coche && PLAN.restant ? { 'Créer le Drive partagé': 1, 'Ajouter au Drive partagé': 3, Ranger: 22, Archiver: 1, Regrouper: 2, Rattacher: 2 } : {},
+    parEtat: PLAN.coche && PLAN.restant < 31 ? { Fait: 31 - PLAN.restant, 'À faire': 7 + PLAN.restant } : { 'À faire': 38 },
+    notifications: PLAN.coche && PLAN.restant ? 3 : 0,
+    echecs: PLAN.restant === 0 && PLAN.coche ? [{ ligne: 12, action: 'Ranger', element: 'Note réunion', detail: 'L\\'élément a été déplacé depuis la préparation du plan. Laissé où il est.' }] : [],
+    manuels: [{ ligne: 2, dossier: 'Marketing 2026', drive: 'Équipe Marketing', remarque: '', etat: PLAN.verifie ? 'Fait (constaté)' : 'À faire', verifie: PLAN.verifie ? '2026-09-27 20:15:00' : '', idDossier: 'demo1', idDrive: 'dp-marketing' },
+      { ligne: 3, dossier: 'Client Acme', drive: 'Client Acme', remarque: '35 éléments appartiennent à des personnes extérieures : Google refusera le déplacement.', etat: 'À faire', verifie: '', idDossier: 'demo2', idDrive: '' }],
+    enCours: null,
+  });
   const executeur = (succes, echec) => new Proxy({}, {
     get: (_, nom) => {
       if (nom === 'withSuccessHandler') return (f) => executeur(f, echec);
@@ -157,6 +179,17 @@ const page = lire('Index')
   // Ce que SocleWeb.page ajoute côté serveur par addMetaTag.
   .replace('<meta charset="utf-8">', '<meta charset="utf-8">\n  <meta name="viewport" content="width=device-width, initial-scale=1">')
   .replace('</head>', `${fauxServeur}\n</head>`);
+
+// Chaque script de la page doit au moins se compiler : une apostrophe mal
+// échappée dans le faux serveur a déjà produit une page morte sans que rien
+// ne le signale ici.
+[...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].forEach((m, rang) => {
+  try {
+    new Function(m[1]); // eslint-disable-line no-new-func
+  } catch (erreur) {
+    throw new Error(`Le script n° ${rang + 1} de l'aperçu ne se compile pas : ${erreur.message}`);
+  }
+});
 
 const sortie = path.join(__dirname, 'apercu.html');
 fs.writeFileSync(sortie, page);

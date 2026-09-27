@@ -6,8 +6,9 @@
  * personne, pas même l'administrateur qui a déployé, ne voit le Drive d'un
  * autre.
  *
- * Le serveur ne fait que lire Drive, page par page. **L'analyse tourne dans le
- * navigateur** (RangementAnalyse.html), pour trois raisons :
+ * Le serveur lit Drive page par page et, depuis la v0.2, applique le plan de
+ * rangement que la personne a validé (RangementPlan.gs). **L'analyse tourne
+ * dans le navigateur** (RangementAnalyse.html), pour trois raisons :
  *
  *   - les éléments y sont déjà, puisque c'est le navigateur qui pilote le
  *     balayage ; les renvoyer au serveur ferait transiter plusieurs mégaoctets
@@ -24,7 +25,7 @@
  */
 
 /** Seule source du numéro de version ; le banc vérifie qu'il vaut VERSION. */
-const RANGEMENT_VERSION_ = '0.1.0';
+const RANGEMENT_VERSION_ = '0.2.0';
 
 function doGet() {
   return SocleWeb.page({
@@ -77,6 +78,54 @@ function rangementReinitialiserReglages() {
  */
 function rangementProposerIa(resume) {
   return SocleWeb.frontiere('rangementProposerIa', () => rangementDemanderIa_(resume));
+}
+
+/* ------------------------------------------------------------ plan puis application (v0.2) */
+
+/** Écrit le plan de rangement dans un nouveau classeur. Rien n'est coché, rien n'est fait. */
+function rangementPreparerPlan(proposition) {
+  return SocleWeb.frontiere('rangementPreparerPlan', () => {
+    SocleErreurs.oublier();
+    return rangementPreparer_(proposition);
+  });
+}
+
+/** Le décompte exact de ce que l'application ferait maintenant. */
+function rangementEtatPlan() {
+  return SocleWeb.frontiere('rangementEtatPlan', () => rangementEtat_());
+}
+
+/** Lance l'application, si le nombre confirmé vaut toujours le nombre réel. */
+function rangementLancerApplication(confirme) {
+  return SocleWeb.frontiere('rangementLancerApplication', () => rangementLancer_(confirme));
+}
+
+/** Un passage de plus, tant que le navigateur reste ouvert. */
+function rangementPoursuivreApplication() {
+  return SocleWeb.frontiere('rangementPoursuivreApplication',
+    () => rangementPoursuivre_(RANGEMENT_BUDGET_NAVIGATEUR_MS_));
+}
+
+function rangementArreterApplication() {
+  return SocleWeb.frontiere('rangementArreterApplication', () => rangementArreter_());
+}
+
+/** Constate, dans Drive, les déplacements vers les Drives partagés faits à la main. */
+function rangementVerifierDeplacements() {
+  return SocleWeb.frontiere('rangementVerifierDeplacements', () => {
+    SocleErreurs.oublier();
+    return rangementVerifierManuels_();
+  });
+}
+
+/**
+ * Cible du déclencheur de reprise : prend le relais quand la fenêtre est
+ * fermée. Une `function` déclarée, parce qu'un déclencheur est résolu par son
+ * nom global. Il s'exécute sous l'identité de la personne qui l'a posé — celle
+ * dont c'est le plan, et personne d'autre.
+ */
+function rangementReprendreApplication() {
+  return rangementPoursuivre_(RANGEMENT_BUDGET_ARRIERE_PLAN_MS_, true);
 }
 
 /**

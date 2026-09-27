@@ -664,7 +664,7 @@ const RangementAnalyse = (() => {
       if (!groupes.has(r)) groupes.set(r, []);
       groupes.get(r).push(c);
     });
-    return [...groupes.values()].map((groupe) => {
+    return [...groupes.values()].map((groupe, rang) => {
       const frequences = new Map();
       groupe.forEach((c) => new Set(mots(c.nom)).forEach((m) => frequences.set(m, (frequences.get(m) || 0) + 1)));
       const meilleur = [...frequences.entries()].sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)[0];
@@ -677,6 +677,9 @@ const RangementAnalyse = (() => {
         if (!deja || deja.roleDrive === 'Lecteur') membres.set(m.adresse, m);
       }));
       return {
+        // Clé stable dans le plan : relie la création du Drive, ses membres et
+        // les dossiers qui iront dedans.
+        cle: `DP${rang + 1}`,
         nomPropose,
         origineNom: groupe.length === 1 ? 'nom du dossier'
           : (meilleur && meilleur[1] > 1 ? `mot commun à ${meilleur[1]} des noms de dossiers` : 'aucun mot commun : nom à choisir'),
@@ -697,6 +700,9 @@ const RangementAnalyse = (() => {
    */
   const produireHierarchie = (elements, arbre, agregats, constats, candidats, cercles, contexte, reglages) => {
     const mouvements = [];
+    // Ce que l'application a besoin de savoir d'un élément : où il est
+    // aujourd'hui, pour vérifier qu'il n'a pas bougé avant de le déplacer.
+    const source = (e) => ({ id: e.id, chemin: arbre.chemin(e), nom: e.nom, genre: e.genre, parentId: e.parent || '' });
     const deplaces = new Set();
     const motsPersonnels = listeMotsPersonnels(reglages);
     const hautNiveau = elements.filter((e) => e.genre === 'dossier' && e.parent === contexte.racineId
@@ -710,8 +716,10 @@ const RangementAnalyse = (() => {
         if (c.niveau !== 'recommande') return;
         const existant = cercle.drivesExistants[0];
         mouvements.push({
-          action: 'drive_partage', source: { id, chemin: c.chemin, nom: c.nom },
+          action: 'drive_partage', source: source(arbre.parId.get(id)),
           destination: existant ? `Drive partagé existant « ${existant.nom} »` : `Nouveau Drive partagé « ${cercle.nomPropose} »`,
+          cible: existant ? { type: 'drive', id: existant.id, nom: existant.nom }
+            : { type: 'nouveauDrive', cle: cercle.cle, nom: cercle.nomPropose },
           raison: `score ${c.score}/100 — ${c.detail.filter((x) => x.points > 0).map((x) => x.signal.toLowerCase()).join(', ')}`,
           certitude: 'présomption',
         });
@@ -725,19 +733,26 @@ const RangementAnalyse = (() => {
       if (deplaces.has(c.objet.id) || ancetres.some((a) => deplaces.has(a))) return;
       const annee = agregats.get(c.objet.id).dernierModifie.slice(0, 4);
       mouvements.push({
-        action: 'archiver', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
-        destination: `Archives / ${annee}`, raison: c.calcul, certitude: 'fait',
+        action: 'archiver', source: source(arbre.parId.get(c.objet.id)),
+        destination: `Archives / ${annee}`, cible: { type: 'chemin', segments: ['Archives', annee] },
+        raison: c.calcul, certitude: 'fait',
       });
       deplaces.add(c.objet.id);
     });
 
-    // 3. Dossiers personnels de premier niveau regroupés
-    const personnels = hautNiveau.filter((d) => !deplaces.has(d.id) && estPersonnel(d.nom, motsPersonnels));
-    if (personnels.length >= 2) {
+    // 3. Dossiers personnels de premier niveau regroupés. Un dossier déjà nommé
+    // « Personnel » est la destination : le déplacer en lui-même serait absurde.
+    const existantPersonnel = hautNiveau.find((d) => comparable(d.nom) === 'personnel');
+    const personnels = hautNiveau.filter((d) => !deplaces.has(d.id) && d !== existantPersonnel
+      && estPersonnel(d.nom, motsPersonnels));
+    if (personnels.length + (existantPersonnel ? 1 : 0) >= 2) {
       personnels.forEach((d) => {
         mouvements.push({
-          action: 'regrouper', source: { id: d.id, chemin: arbre.chemin(d), nom: d.nom },
-          destination: 'Personnel', raison: 'nom évoquant la vie privée ; regroupés, ils ne se mêlent plus au travail',
+          action: 'regrouper', source: source(d),
+          destination: 'Personnel',
+          cible: existantPersonnel ? { type: 'dossier', id: existantPersonnel.id, segments: [existantPersonnel.nom] }
+            : { type: 'chemin', segments: ['Personnel'] },
+          raison: 'nom évoquant la vie privée ; regroupés, ils ne se mêlent plus au travail',
           certitude: 'présomption',
         });
         deplaces.add(d.id);
@@ -764,14 +779,16 @@ const RangementAnalyse = (() => {
         const annee = (f.modifie || '').slice(0, 4);
         mouvements.push(meilleur
           ? {
-            action: 'ranger', source: { id: f.id, chemin: arbre.chemin(f), nom: f.nom },
+            action: 'ranger', source: source(f),
             destination: meilleur.v.dossier.nom,
+            cible: { type: 'dossier', id: meilleur.v.dossier.id, segments: [meilleur.v.dossier.nom] },
             raison: `mot${meilleur.communs.length > 1 ? 's' : ''} commun${meilleur.communs.length > 1 ? 's' : ''} : ${meilleur.communs.join(', ')}`,
             certitude: 'présomption',
           }
           : {
-            action: 'ranger', source: { id: f.id, chemin: arbre.chemin(f), nom: f.nom },
+            action: 'ranger', source: source(f),
             destination: annee ? `À trier / ${annee}` : 'À trier',
+            cible: { type: 'chemin', segments: annee ? ['À trier', annee] : ['À trier'] },
             raison: 'aucun dossier existant ne partage de mot avec ce nom : à classer à la main',
             certitude: 'fait',
           });
@@ -780,22 +797,23 @@ const RangementAnalyse = (() => {
     // 5. Orphelins
     elements.filter((e) => arbre.situation.get(e.id).lieu === 'orphelin').forEach((e) => {
       mouvements.push({
-        action: 'rattacher', source: { id: e.id, chemin: e.nom, nom: e.nom },
-        destination: 'À trier / Sans dossier', raison: 'élément à vous, rangé nulle part', certitude: 'fait',
+        action: 'rattacher', source: source(e),
+        destination: 'À trier / Sans dossier', cible: { type: 'chemin', segments: ['À trier', 'Sans dossier'] },
+        raison: 'élément à vous, rangé nulle part', certitude: 'fait',
       });
     });
 
     // 6. Niveaux inutiles et doublons de dossiers : simplifications en place
     constats.filter((c) => c.code === 'NIVEAU_INUTILE').forEach((c) => {
       mouvements.push({
-        action: 'aplatir', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
-        destination: 'son contenu remonte d\'un niveau', raison: c.calcul, certitude: 'fait',
+        action: 'aplatir', source: source(arbre.parId.get(c.objet.id)),
+        destination: 'son contenu remonte d\'un niveau', cible: { type: 'manuel' }, raison: c.calcul, certitude: 'fait',
       });
     });
     constats.filter((c) => c.code === 'DOSSIERS_HOMONYMES').forEach((c) => {
       mouvements.push({
-        action: 'fusionner', source: { id: c.objet.id, chemin: c.objet.chemin, nom: c.objet.nom },
-        destination: `un seul « ${c.objet.nom} »`, raison: c.calcul, certitude: 'présomption',
+        action: 'fusionner', source: source(arbre.parId.get(c.objet.id)),
+        destination: `un seul « ${c.objet.nom} »`, cible: { type: 'manuel' }, raison: c.calcul, certitude: 'présomption',
       });
     });
 
@@ -904,6 +922,56 @@ const RangementAnalyse = (() => {
     return { envoi: { dossiers, constats: parCode }, table, tronque: agregats.size > maximum, total: agregats.size };
   };
 
+  /* ------------------------------------------------------------ proposition de plan (v0.2) */
+
+  const ACTIONS_AUTOMATIQUES = ['ranger', 'archiver', 'regrouper', 'rattacher'];
+
+  /**
+   * Ce qui part vers le serveur pour écrire le plan. Trois listes, parce que
+   * ce ne sont pas les mêmes gestes :
+   *
+   *   mouvements           déplacements dans Mon Drive, que l'outil appliquera ;
+   *   drivesACreer         Drives partagés à créer, avec leurs membres ;
+   *   deplacementsManuels  dossiers à faire glisser dans Drive : l'API refuse de
+   *                        déplacer un dossier de Mon Drive vers un Drive partagé.
+   *
+   * « Aplatir » et « fusionner » n'y sont pas : ce sont des présomptions sur la
+   * structure, que l'outil signale mais ne fait pas.
+   */
+  const propositionDePlan = (rapport) => {
+    const parCandidat = new Map(rapport.candidats.map((c) => [c.id, c]));
+    const mouvements = rapport.hierarchie.mouvements
+      .filter((m) => ACTIONS_AUTOMATIQUES.includes(m.action))
+      .map((m) => ({
+        action: m.action, id: m.source.id, nom: m.source.nom, chemin: m.source.chemin,
+        genre: m.source.genre, parentId: m.source.parentId,
+        destination: m.cible.segments, destinationId: m.cible.type === 'dossier' ? m.cible.id : '',
+        raison: m.raison, certitude: m.certitude,
+      }));
+    const deplacementsManuels = rapport.hierarchie.mouvements
+      .filter((m) => m.action === 'drive_partage')
+      .map((m) => {
+        const candidat = parCandidat.get(m.source.id);
+        return {
+          id: m.source.id, nom: m.source.nom, chemin: m.source.chemin, drive: m.cible.nom,
+          driveId: m.cible.type === 'drive' ? m.cible.id : '',
+          cleDrive: m.cible.type === 'nouveauDrive' ? m.cible.cle : '',
+          remarque: candidat ? candidat.obstacles.map((o) => o.texte).join(' ') : '',
+        };
+      });
+    const cles = new Set(deplacementsManuels.map((d) => d.cleDrive).filter(Boolean));
+    const drivesACreer = rapport.cercles.filter((c) => cles.has(c.cle)).map((c) => ({
+      cle: c.cle,
+      nom: c.nomPropose,
+      raison: `Regroupe ${c.dossiers.length} dossier(s) d'équipe ; nom tiré de : ${c.origineNom}.`,
+      membres: c.membres.map((m) => ({ adresse: m.adresse, role: m.roleDrive, groupe: m.groupe === true })),
+    }));
+    return {
+      mouvements, drivesACreer, deplacementsManuels,
+      nonAutomatiques: rapport.hierarchie.mouvements.filter((m) => m.cible && m.cible.type === 'manuel').length,
+    };
+  };
+
   /* ------------------------------------------------------------ export CSV */
 
   /**
@@ -953,7 +1021,7 @@ const RangementAnalyse = (() => {
   };
 
   return {
-    analyser, resumePourIa, csv,
+    analyser, resumePourIa, csv, propositionDePlan,
     // Exposés pour le banc.
     construireArbre, agreger, radical, formatDate, mots, estPersonnel, jaccard, LIMITES_GOOGLE,
   };

@@ -74,9 +74,25 @@ Ouvrez l'URL `/exec`, autorisez, lancez une analyse sur votre propre Drive. Puis
 
 Pour désactiver : supprimez la propriété, ou exécutez `rangementDefinirCleIa('')`.
 
-## 5. Mettre à jour
+## 5. Le rangement, côté utilisateur
+
+1. Onglet **Hiérarchie proposée** : **Préparer le plan**. Un classeur « Plan de rangement Drive » apparaît dans le dossier *Rangement Drive — plans* de son Drive.
+2. Dans Sheets, cocher **Valider** sur les lignes approuvées ; corriger une Destination si besoin. Rien n'est coché d'office.
+3. Onglet **Application** : relire le décompte, confirmer, suivre. La fenêtre peut se fermer : l'application continue en arrière-plan.
+4. Faire glisser dans Drive les dossiers listés « À faire vous-même », puis **Vérifier les déplacements**.
+
+Le premier « Préparer le plan » redemande l'autorisation : l'outil demande désormais
+d'écrire dans Drive et dans Sheets (voir [les portées](README.md#portées-demandées)).
+
+## 6. Mettre à jour
 
 Après un `clasp push` ou une modification : **Gérer les déploiements > modifier > Version : nouvelle version**.
+
+> **Passage de la v0.1 à la v0.2** : les portées changent (`drive` au lieu de
+> `drive.readonly`, plus `spreadsheets` et `script.scriptapp`). Chaque utilisateur
+> verra de nouveau l'écran d'autorisation Google à sa prochaine visite : prévenez-les,
+> un écran inattendu qui demande « voir, modifier, créer et supprimer vos fichiers »
+> inquiète à juste titre. Le README dit ce que l'outil en fait, et ce qu'il n'en fait pas.
 
 L'URL `/exec` sert la version déployée, figée ; l'URL `/dev` sert le code courant. Si
 l'une marche et pas l'autre, c'est qu'il manque ce redéploiement. Le pied de page de
@@ -90,4 +106,7 @@ l'application affiche le numéro de version qui tourne.
 | La lecture s'interrompt | Le bouton « Reprendre la lecture » repart de la dernière page lue. |
 | Analyse arrêtée en cours | Un bandeau le dit : des dossiers peuvent paraître vides ou orphelins faute d'avoir été lus. |
 | Bandeau « certaines données n'ont pas pu être lues » | Les résultats qui en dépendent sont marqués « non mesuré ». Relancez plus tard. |
+| Ligne « Échec » : *pas pu être créé* (Drive partagé) | L'organisation interdit peut-être la création de Drives partagés (console d'administration > Applications > Google Workspace > Drive et Docs > Paramètres de partage > Création de Drive partagé). Autorisez-la, ou créez le Drive vous-même et préparez un nouveau plan. |
+| Ligne « Échec » : *déplacé depuis la préparation* | Voulu : l'outil ne déplace pas sur la foi d'un plan périmé. Relancez une analyse pour un plan à jour. |
+| Application figée sur « une autre application tourne » | Un autre onglet ou le déclencheur de reprise travaille. Attendez, ou **Arrêter** puis relancez. |
 | Erreur « imprévue » avec une référence | Cherchez l'heure de la référence dans **Exécutions** de l'éditeur : le détail technique y est. |

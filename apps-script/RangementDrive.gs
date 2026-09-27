@@ -2,8 +2,9 @@
  * Rangement Drive — lecture de Drive. Introduit en v0.1.
  *
  * Ce fichier ne lit que des **métadonnées** : nom, type, dossier parent,
- * propriétaire, dates, partages. Le contenu d'un fichier n'est jamais ouvert,
- * et la portée demandée (`drive.readonly`) ne permet de rien modifier.
+ * propriétaire, dates, partages. Le contenu d'un fichier n'est jamais ouvert.
+ * Il n'écrit rien : les écritures vivent dans RangementPlan.gs, et le banc
+ * vérifie qu'elles n'existent nulle part ailleurs.
  */
 
 /**
@@ -101,6 +102,7 @@ const rangementContexte_ = () => {
     reglages: rangementLireReglages_(),
     reglagesParDefaut: RANGEMENT_REGLAGES_DEFAUT_,
     ia: rangementEtatIa_(),
+    plan: SocleErreurs.absorber('pointeur du plan illisible', () => rangementPlanCourant_(), null),
     absorptions: SocleErreurs.bilan(),
   };
 };

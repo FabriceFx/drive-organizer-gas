@@ -31,7 +31,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const { execFileSync } = require('child_process');
-const { construireSandbox } = require('./faux-google');
+const { construireSandbox, TUEE } = require('./faux-google');
 
 const RACINE = path.join(__dirname, '..');
 const SOURCES = path.join(RACINE, 'apps-script');
@@ -78,6 +78,9 @@ const contient = (texte, morceau) => {
 const chargerServeur = (options = {}) => {
   const contexte = construireSandbox(options);
   vm.createContext(contexte.sandbox);
+  // Le faux classeur rend des Date du bac à sable, comme Sheets rend des Date
+  // du moteur d'Apps Script : sans cela, `instanceof Date` échouerait.
+  contexte.etatFaux.Date = vm.runInContext('Date', contexte.sandbox);
   fichiersGs().forEach((nom) => {
     vm.runInContext(lireSource(nom), contexte.sandbox, { filename: nom });
   });
@@ -149,9 +152,11 @@ verifier('chaque fichier inclus par Index.html existe', () => {
 section('B. Source');
 
 const FONCTIONS_EXPOSEES = [
-  'doGet', 'rangementBalayerPage', 'rangementDefinirCleIa', 'rangementDefinirDomainesInternes',
-  'rangementDemarrer', 'rangementDrivesPartages', 'rangementEnregistrerReglages',
-  'rangementProposerIa', 'rangementReinitialiserReglages',
+  'doGet', 'rangementArreterApplication', 'rangementBalayerPage', 'rangementDefinirCleIa',
+  'rangementDefinirDomainesInternes', 'rangementDemarrer', 'rangementDrivesPartages',
+  'rangementEnregistrerReglages', 'rangementEtatPlan', 'rangementLancerApplication',
+  'rangementPoursuivreApplication', 'rangementPreparerPlan', 'rangementProposerIa',
+  'rangementReinitialiserReglages', 'rangementReprendreApplication', 'rangementVerifierDeplacements',
 ];
 
 const fonctionsDeclarees = () => fichiersGs().filter((n) => n.startsWith('Rangement'))
@@ -170,6 +175,7 @@ verifier('chaque appel du navigateur vise une fonction déclarée, sans trait de
   appels.forEach((nom) => {
     vrai(!nom.endsWith('_'), `${nom} finit par un trait de soulignement`);
     vrai(FONCTIONS_EXPOSEES.includes(nom), `${nom} n'est pas une fonction déclarée`);
+    vrai(nom !== 'rangementReprendreApplication', 'la cible du déclencheur n\'a pas à être appelée du navigateur');
   });
 });
 
@@ -190,12 +196,16 @@ verifier('un seul chemin vers l\'extérieur : appelHttp, depuis RangementIa.gs s
   egal((sansCommentaires(lireSource('RangementIa.gs')).match(/appelHttp\(/g) || []).length, 1);
 });
 
-verifier('les portées sont exactement lecture Drive + appel externe', () => {
+verifier('les portées sont exactement celles du rangement, et documentées', () => {
   const manifeste = JSON.parse(lireSource('appsscript.json'));
   egal(manifeste.oauthScopes.slice().sort(), [
-    'https://www.googleapis.com/auth/drive.readonly',
+    'https://www.googleapis.com/auth/drive',
     'https://www.googleapis.com/auth/script.external_request',
+    'https://www.googleapis.com/auth/script.scriptapp',
+    'https://www.googleapis.com/auth/spreadsheets',
   ]);
+  const readme = fs.readFileSync(path.join(RACINE, 'README.md'), 'utf8');
+  manifeste.oauthScopes.forEach((portee) => contient(readme, portee.replace('https://www.googleapis.com/auth/', '')));
   egal(manifeste.webapp.executeAs, 'USER_ACCESSING');
   egal(manifeste.runtimeVersion, 'V8');
 });
@@ -208,11 +218,40 @@ verifier('aucun contenu de fichier n\'est lu : ni export, ni téléchargement, n
   });
 });
 
-verifier('aucune méthode d\'écriture de Drive n\'est appelée', () => {
+verifier('ni suppression, ni corbeille, ni retrait de droits, nulle part', () => {
+  // Compensation de la portée « drive », qui permettrait tout cela.
   fichiersGs().forEach((n) => {
-    vrai(!/Drive\.(Files|Permissions|Drives)\.(create|update|remove|delete|copy|emptyTrash)\b/
+    vrai(!/Drive\.Files\.(delete|emptyTrash|copy)\b|Drive\.Drives\.(delete|update|hide)\b|Drive\.Permissions\.(delete|update)\b|trashed:\s*true/
       .test(sansCommentaires(lireSource(n))), n);
   });
+});
+
+verifier('les écritures dans Drive vivent dans RangementPlan.gs, et nulle part ailleurs', () => {
+  const ecrivains = fichiersGs().filter((n) => /Drive\.(Files\.(update|create)|Drives\.create|Permissions\.create)\(/
+    .test(sansCommentaires(lireSource(n))));
+  egal(ecrivains, ['RangementPlan.gs']);
+});
+
+verifier('un déplacement ne modifie jamais les métadonnées : ressource vide, toujours', () => {
+  // Ni renommage, ni corbeille : Files.update ne sert qu'à changer de parent.
+  const code = sansCommentaires(lireSource('RangementPlan.gs'));
+  const appels = (code.match(/Drive\.Files\.update\(/g) || []).length;
+  egal(appels > 0, true);
+  egal((code.match(/Drive\.Files\.update\(\{\}\s*,/g) || []).length, appels);
+});
+
+verifier('l\'outil ne crée que des dossiers', () => {
+  const code = sansCommentaires(lireSource('RangementPlan.gs'));
+  const creations = [...code.matchAll(/Drive\.Files\.create\(\{([\s\S]*?)\}/g)];
+  egal(creations.length > 0, true);
+  creations.forEach((m) => contient(m[1], 'mimeType: RANGEMENT_MIME_DOSSIER_'));
+});
+
+verifier('les droits accordés : jamais par lien ou à tout le domaine, jamais gestionnaire', () => {
+  const code = sansCommentaires(lireSource('RangementPlan.gs'));
+  vrai(!/type:\s*'(anyone|domain)'/.test(code));
+  const roles = Object.values(chargerServeur().lire('RANGEMENT_ROLES_DRIVE_'));
+  vrai(!roles.includes('organizer') && !roles.includes('owner'), roles.join(','));
 });
 
 verifier('jamais de slice(0, 10) sur un horodatage', () => {
@@ -833,6 +872,360 @@ verifier('un Drive de 50 000 éléments s\'analyse en moins de 5 secondes', () =
   Analyse.analyser(grand, CONTEXTE, REGLAGES, []);
   const duree = Date.now() - debut;
   vrai(duree < 5000, `${duree} ms`);
+});
+
+
+/* ==========================================================================
+ * G. Plan puis application (v0.2)
+ * ======================================================================= */
+
+section('G. Plan puis application');
+
+const MIME_DOSSIER = 'application/vnd.google-apps.folder';
+
+/** Un petit Drive, de la forme exacte de l'API, qui porte chaque cas du plan. */
+const drivePourPlan = () => {
+  const f = [];
+  const fichier = (id, name, parents, champs = {}) => f.push({
+    id, name, mimeType: 'application/vnd.google-apps.document', parents, ownedByMe: true,
+    owners: [{ emailAddress: 'moi@exemple.fr' }], createdTime: '2026-01-01T09:00:00Z',
+    modifiedTime: '2026-09-01T09:00:00Z', quotaBytesUsed: '100', shared: false,
+    lastModifyingUser: { me: true, emailAddress: 'moi@exemple.fr' }, permissions: [], trashed: false,
+    ...champs,
+  });
+  const dossier = (id, name, parents, champs = {}) => fichier(id, name, parents, { mimeType: MIME_DOSSIER, quotaBytesUsed: '0', ...champs });
+  dossier('dCompta', 'Compta', ['root00']);
+  fichier('fReleve', 'Relevé', ['dCompta']);
+  fichier('fBudget', 'Budget compta 2024.xlsx', ['root00']);
+  fichier('fFacture1', 'Facture compta mars', ['root00']);
+  fichier('fFacture2', 'Facture compta avril', ['root00']);
+  for (let i = 1; i <= 16; i += 1) fichier(`fNote${String(i).padStart(2, '0')}`, `Note ${i}`, ['root00']);
+  fichier('fFormule', '=IMPORTXML("http://x", "//a")', ['root00']);
+  dossier('dVieux', 'Vieux projet', ['root00']);
+  fichier('fVieux', 'Cahier', ['dVieux'], { modifiedTime: '2019-03-01T09:00:00Z' });
+  fichier('fPerdu', 'Perdu.pdf', undefined);
+  dossier('dAlpha', 'Projet Alpha', ['root00'], {
+    shared: true,
+    permissions: ['a', 'b', 'c'].map((x) => ({ type: 'user', role: 'writer', emailAddress: `${x}@exemple.fr` })),
+  });
+  for (let i = 0; i < 5; i += 1) {
+    fichier(`fAlpha${i}`, `Spec ${i}`, ['dAlpha'], { lastModifyingUser: { me: false, emailAddress: 'a@exemple.fr' } });
+  }
+  return f;
+};
+
+/** Balayage par le serveur, analyse par le navigateur, préparation du plan : le vrai parcours. */
+const preparerPlan = (options = {}) => {
+  const ctx = chargerServeur({ fichiers: drivePourPlan(), racineId: 'root00', ...options });
+  const elements = [];
+  let jeton = null;
+  do {
+    const page = ctx.lire('rangementBalayerPage')(jeton);
+    elements.push(...page.valeur.elements);
+    jeton = page.valeur.jetonSuivant;
+  } while (jeton);
+  const contexte = { ...ctx.lire('rangementDemarrer')().valeur, aujourdhui: '2026-09-27' };
+  const rapport = Analyse.analyser(elements, contexte, REGLAGES, []);
+  const proposition = JSON.parse(JSON.stringify(Analyse.propositionDePlan(rapport)));
+  const prep = ctx.lire('rangementPreparerPlan')(proposition);
+  if (!prep.ok) throw new Error(`préparation : ${prep.message}`);
+  const classeur = ctx.sheets.classeurs.get(prep.valeur.id);
+  return { ctx, prep: prep.valeur, classeur, feuille: classeur.getSheetByName('Plan'), proposition };
+};
+
+/** Les lignes d'un onglet, indexées par en-tête, telles qu'elles sont commises. */
+const lignesDe = (feuille) => {
+  const valeurs = feuille.getRange(1, 1, feuille.getLastRow(), feuille.getLastColumn()).getValues();
+  const entete = valeurs[0];
+  return valeurs.slice(1).map((v, i) => {
+    const l = { numero: i + 2 };
+    entete.forEach((t, j) => { l[t] = v[j]; });
+    return l;
+  });
+};
+
+const colonne = (feuille, titre) => feuille.getRange(1, 1, 1, feuille.getLastColumn()).getValues()[0].indexOf(titre) + 1;
+
+/** Coche comme le ferait la personne : écriture directe, commise. */
+const cocher = (feuille, filtre = () => true) => {
+  const c = colonne(feuille, 'Valider');
+  lignesDe(feuille).filter(filtre).forEach((l) => feuille.cocher(l.numero, c, true));
+};
+const ecrireCellule = (feuille, numero, titre, valeur) => feuille.cocher(numero, colonne(feuille, titre), valeur);
+
+const parentsDe = (ctx, id) => ctx.fichiers.find((f) => f.id === id).parents || [];
+const dossierNomme = (ctx, nom, parent) => ctx.fichiers.filter((f) => f.name === nom && f.mimeType === MIME_DOSSIER
+  && (!parent || (f.parents || []).includes(parent)));
+
+/** Lance puis poursuit jusqu'au bout, comme le navigateur. */
+const appliquerTout = (ctx) => {
+  const etat = ctx.lire('rangementEtatPlan')().valeur;
+  let r = ctx.lire('rangementLancerApplication')(etat.aTraiter);
+  for (let tours = 0; r.ok && r.valeur.restant > 0 && tours < 20; tours += 1) {
+    r = ctx.lire('rangementPoursuivreApplication')();
+  }
+  return r;
+};
+
+verifier('préparer n\'écrit que le plan : rien de coché, rien de déplacé', () => {
+  const { ctx, prep, feuille } = preparerPlan();
+  const lignes = lignesDe(feuille);
+  egal(lignes.length, prep.lignes);
+  vrai(lignes.every((l) => l.Valider === false), 'aucune case cochée d\'office');
+  vrai(lignes.every((l) => l['État'] === 'À faire'));
+  egal(ctx.ecritures.deplacements.filter((d) => d.id !== prep.id), [], 'seul le classeur du plan est rangé');
+  egal(ctx.ecritures.drivesCrees, []);
+  egal(ctx.ecritures.membresAjoutes, []);
+  vrai(ctx.magasins.user.has('RANGEMENT_PLAN') && !ctx.magasins.script.has('RANGEMENT_PLAN'), 'pointeur dans le magasin de la personne');
+});
+
+verifier('le plan se lit dans l\'ordre où il sera traité : créer, peupler, ranger', () => {
+  const { feuille } = preparerPlan();
+  const actions = lignesDe(feuille).map((l) => l.Action);
+  egal(actions[0], 'Créer le Drive partagé');
+  egal(actions.slice(1, 4), ['Ajouter au Drive partagé', 'Ajouter au Drive partagé', 'Ajouter au Drive partagé']);
+  vrai(actions.slice(4).every((a) => ['Ranger', 'Archiver', 'Regrouper', 'Rattacher'].includes(a)));
+});
+
+verifier('les colonnes techniques sont masquées, le classeur rangé hors de la racine', () => {
+  const { ctx, prep, feuille } = preparerPlan();
+  ['ID élément', 'ID parent d\'origine', 'ID destination', 'Destination prévue', 'Jeton de création', 'Type de membre']
+    .forEach((t) => vrai(feuille.masquees.has(colonne(feuille, t)), t));
+  const dossierPlans = dossierNomme(ctx, 'Rangement Drive — plans', 'root00');
+  egal(dossierPlans.length, 1);
+  egal(parentsDe(ctx, prep.id), [dossierPlans[0].id]);
+});
+
+verifier('défaut évité : un nom de fichier « =IMPORTXML(…) » reste du texte dans le plan', () => {
+  const { ctx, feuille } = preparerPlan();
+  egal(ctx.etatFaux.formules, []);
+  vrai(lignesDe(feuille).some((l) => l['Élément'] === '=IMPORTXML("http://x", "//a")'));
+});
+
+verifier('le dossier d\'équipe va dans l\'onglet des déplacements à faire dans Drive', () => {
+  const { classeur } = preparerPlan();
+  const manuels = lignesDe(classeur.getSheetByName('À déplacer dans Drive'));
+  egal(manuels.map((l) => l['ID dossier']), ['dAlpha']);
+  egal(manuels[0]['Clé Drive'], 'DP1');
+});
+
+verifier('le décompte annoncé est exact, et revérifié au lancement', () => {
+  const { ctx, feuille } = preparerPlan();
+  egal(ctx.lire('rangementEtatPlan')().valeur.aTraiter, 0);
+  cocher(feuille);
+  const etat = ctx.lire('rangementEtatPlan')().valeur;
+  egal(etat.aTraiter, lignesDe(feuille).length);
+  egal(etat.notifications, 3);
+  const refus = ctx.lire('rangementLancerApplication')(etat.aTraiter - 1);
+  egal(refus.ok, false);
+  contient(refus.message, 'a changé depuis votre relecture');
+  egal(ctx.ecritures.drivesCrees, []);
+});
+
+verifier('application complète : chaque élément à sa place, chaque dossier créé une fois', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille);
+  const r = appliquerTout(ctx);
+  vrai(r.ok, JSON.stringify(r));
+  const aTrier = dossierNomme(ctx, 'À trier', 'root00');
+  egal(aTrier.length, 1);
+  const annee = dossierNomme(ctx, '2026', aTrier[0].id);
+  egal(annee.length, 1);
+  egal(parentsDe(ctx, 'fNote01'), [annee[0].id]);
+  egal(parentsDe(ctx, 'fFormule'), [annee[0].id]);
+  egal(parentsDe(ctx, 'fBudget'), ['dCompta'], 'rangé par vocabulaire dans le dossier existant');
+  const archives = dossierNomme(ctx, 'Archives', 'root00');
+  egal(parentsDe(ctx, 'dVieux'), [dossierNomme(ctx, '2019', archives[0].id)[0].id]);
+  egal(parentsDe(ctx, 'fPerdu'), [dossierNomme(ctx, 'Sans dossier', aTrier[0].id)[0].id], 'l\'orphelin est rattaché');
+  egal(ctx.ecritures.drivesCrees.map((d) => d.name), ['Projet Alpha']);
+  egal(ctx.ecritures.membresAjoutes.map((m) => [m.ressource.emailAddress, m.ressource.role, m.params.sendNotificationEmail]),
+    [['a@exemple.fr', 'fileOrganizer', true], ['b@exemple.fr', 'fileOrganizer', true], ['c@exemple.fr', 'fileOrganizer', true]]);
+  vrai(lignesDe(feuille).every((l) => l['État'] === 'Fait'), JSON.stringify(lignesDe(feuille).map((l) => [l.Action, l['État'], l['Détail']])));
+  egal(ctx.ecritures.metadonnees, [], 'aucun renommage, aucune corbeille');
+  egal(parentsDe(ctx, 'dAlpha'), ['root00'], 'le dossier d\'équipe n\'est pas déplacé par l\'outil');
+  vrai(!ctx.magasins.user.has('RANGEMENT_APPLICATION'), 'autorisation retirée en fin de file');
+  egal(ctx.declencheurs, [], 'aucun déclencheur laissé derrière');
+});
+
+verifier('une ligne non cochée n\'est jamais traitée', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille, (l) => l['ID élément'] !== 'fNote01');
+  vrai(appliquerTout(ctx).ok);
+  egal(parentsDe(ctx, 'fNote01'), ['root00']);
+});
+
+verifier('un élément déplacé depuis la préparation est laissé où il est', () => {
+  const { ctx, feuille } = preparerPlan();
+  ctx.fichiers.find((f) => f.id === 'fNote02').parents = ['dCompta'];
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  egal(parentsDe(ctx, 'fNote02'), ['dCompta']);
+  const ligne = lignesDe(feuille).find((l) => l['ID élément'] === 'fNote02');
+  egal(ligne['État'], 'Échec');
+  contient(ligne['Détail'], 'déplacé depuis la préparation');
+});
+
+verifier('une destination corrigée à la main l\'emporte sur celle de l\'outil', () => {
+  const { ctx, feuille } = preparerPlan();
+  const ligne = lignesDe(feuille).find((l) => l['ID élément'] === 'fNote03');
+  ecrireCellule(feuille, ligne.numero, 'Destination', 'Clients / Prospects');
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const clients = dossierNomme(ctx, 'Clients', 'root00');
+  egal(parentsDe(ctx, 'fNote03'), [dossierNomme(ctx, 'Prospects', clients[0].id)[0].id]);
+});
+
+verifier('défaut évité : tuée à n\'importe quel moment, l\'application reprend sans rien faire deux fois', () => {
+  // On tue l'exécution au n-ième vidage du tampon, pour chaque n : entre une
+  // action et son enregistrement, entre une création de Drive et l'écriture
+  // de son identifiant, etc. La reprise doit toujours aboutir au même état.
+  let points = 0;
+  for (let rang = 1; rang <= 200; rang += 1) {
+    const { ctx, feuille } = preparerPlan();
+    cocher(feuille);
+    const confirme = ctx.lire('rangementEtatPlan')().valeur.aTraiter;
+    ctx.sheets.flush.tuerAu = ctx.sheets.flush.compte + rang;
+    try { ctx.lire('rangementLancerApplication')(confirme); } catch (e) { if (e !== TUEE) throw e; }
+    // `frontiere` rend la mort en erreur au lieu de la laisser remonter : ce
+    // qui compte est l'état laissé derrière, et la nouvelle exécution.
+    ctx.sheets.flush.tuerAu = null;
+    if (!ctx.etatFaux.mort) break;   // au-delà du dernier vidage : tout le parcours est couvert
+    ctx.etatFaux.mort = false;
+    points += 1;
+    let r = ctx.lire('rangementPoursuivreApplication')();
+    for (let t = 0; r.ok && r.valeur.restant > 0 && t < 20; t += 1) r = ctx.lire('rangementPoursuivreApplication')();
+    const deplacesDeuxFois = Object.entries(ctx.ecritures.deplacements.reduce((m, d) => ({ ...m, [d.id]: (m[d.id] || 0) + 1 }), {}))
+      .filter(([, n]) => n > 1);
+    egal(deplacesDeuxFois, [], `tuée au vidage n° ${rang}`);
+    egal(ctx.ecritures.drivesCrees.length, 1, `Drive créé une seule fois, tuée au vidage n° ${rang}`);
+    egal(new Set(ctx.ecritures.membresAjoutes.map((m) => m.ressource.emailAddress)).size, ctx.ecritures.membresAjoutes.length,
+      `membre ajouté une seule fois, tuée au vidage n° ${rang}`);
+    const etats = lignesDe(feuille).map((l) => l['État']);
+    vrai(etats.every((e) => e === 'Fait'), `tuée au vidage n° ${rang} : ${etats.join(', ')}`);
+  }
+  vrai(points > 40, `${points} points d'interruption seulement`);
+});
+
+verifier('création de Drive refusée par l\'organisation : échec qui dit quoi faire, et les membres suivent', () => {
+  const { ctx, feuille } = preparerPlan({ creationDriveInterdite: true });
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const lignes = lignesDe(feuille);
+  const creation = lignes.find((l) => l.Action === 'Créer le Drive partagé');
+  egal(creation['État'], 'Échec');
+  contient(creation['Détail'], 'autorise');
+  lignes.filter((l) => l.Action === 'Ajouter au Drive partagé').forEach((l) => {
+    egal(l['État'], 'Échec');
+    contient(l['Détail'], 'n\'est pas créé');
+  });
+  egal(ctx.ecritures.membresAjoutes, []);
+});
+
+verifier('défaut évité : création refusée, un Drive homonyme préexistant n\'est pas pris pour le sien', () => {
+  const collegue = { id: 'drvCollegue', name: 'Projet Alpha', createdTime: '2025-03-01T10:00:00.000Z',
+    permissions: [{ type: 'user', role: 'organizer', emailAddress: 'x@exemple.fr' }] };
+  const { ctx, feuille } = preparerPlan({ creationDriveInterdite: true, drivesPartages: [collegue] });
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const creation = lignesDe(feuille).find((l) => l.Action === 'Créer le Drive partagé');
+  egal(creation['État'], 'Échec');
+  egal(creation['ID destination'], '');
+  egal(ctx.ecritures.membresAjoutes, [], 'aucun membre ajouté au Drive du collègue');
+  vrai(lignesDe(feuille).filter((l) => l.Action === 'Ranger').every((l) => l['État'] === 'Fait'), 'la file continue après l\'échec');
+});
+
+verifier('défaut évité : au premier départ, même un homonyme récent n\'est pas adopté', () => {
+  // Créé après la préparation, mais par quelqu'un d'autre : cette ligne n'a
+  // encore rien tenté, il n'y a donc rien à « retrouver ».
+  const recent = { id: 'drvRecent', name: 'Projet Alpha', createdTime: '2099-01-01T00:00:00.000Z', permissions: [] };
+  const { ctx, feuille } = preparerPlan({ creationDriveInterdite: true, drivesPartages: [recent] });
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  egal(lignesDe(feuille).find((l) => l.Action === 'Créer le Drive partagé')['État'], 'Échec');
+  egal(ctx.ecritures.membresAjoutes, []);
+});
+
+verifier('défaut évité : après une tentative tuée, un homonyme antérieur au plan n\'est pas adopté', () => {
+  // La tentative précédente est morte avant d'avoir créé quoi que ce soit ;
+  // la création est refusée ; seul existe le Drive d'un collègue, plus ancien.
+  const collegue = { id: 'drvCollegue', name: 'Projet Alpha', createdTime: '2025-03-01T10:00:00.000Z', permissions: [] };
+  const { ctx, feuille } = preparerPlan({ creationDriveInterdite: true, drivesPartages: [collegue] });
+  cocher(feuille);
+  const creation = lignesDe(feuille).find((l) => l.Action === 'Créer le Drive partagé');
+  ecrireCellule(feuille, creation.numero, 'État', 'En cours');
+  ecrireCellule(feuille, creation.numero, 'Départs', 1);
+  vrai(appliquerTout(ctx).ok);
+  const apres = lignesDe(feuille).find((l) => l.numero === creation.numero);
+  egal(apres['État'], 'Échec');
+  egal(apres['ID destination'], '');
+  egal(ctx.ecritures.membresAjoutes, []);
+});
+
+verifier('une destination existante n\'est vérifiée qu\'une fois par exécution', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille);
+  const get = ctx.sandbox.Drive.Files.get;
+  let lectures = 0;
+  ctx.sandbox.Drive.Files.get = (id, p) => { if (id === 'dCompta') lectures += 1; return get(id, p); };
+  vrai(appliquerTout(ctx).ok);
+  egal(['fBudget', 'fFacture1', 'fFacture2'].map((id) => parentsDe(ctx, id)), [['dCompta'], ['dCompta'], ['dCompta']]);
+  egal(lectures, 1, 'trois fichiers rangés dans « Compta », une seule vérification');
+});
+
+verifier('un membre déjà présent est constaté, pas ajouté deux fois', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const membre = lignesDe(feuille).find((l) => l.Action === 'Ajouter au Drive partagé');
+  ecrireCellule(feuille, membre.numero, 'État', 'À faire');
+  vrai(appliquerTout(ctx).ok);
+  contient(lignesDe(feuille).find((l) => l.numero === membre.numero)['Détail'], 'Déjà membre');
+  egal(ctx.ecritures.membresAjoutes.length, 3);
+});
+
+verifier('verrou de la personne déjà pris : rien ne se fait', () => {
+  const { ctx, feuille } = preparerPlan({ verrouPris: true });
+  cocher(feuille);
+  const r = ctx.lire('rangementLancerApplication')(ctx.lire('rangementEtatPlan')().valeur.aTraiter);
+  vrai(r.ok);
+  egal(r.valeur.refus, 'verrou');
+  egal(parentsDe(ctx, 'fNote01'), ['root00']);
+});
+
+verifier('arrêter retire l\'autorisation et les déclencheurs ; la reprise ne fait alors rien', () => {
+  const { ctx, feuille } = preparerPlan();
+  cocher(feuille);
+  ctx.magasins.user.set('RANGEMENT_APPLICATION', JSON.stringify({ plan: 'x' }));
+  ctx.sandbox.ScriptApp.newTrigger('rangementReprendreApplication').timeBased().after(60000).create();
+  ctx.lire('rangementArreterApplication')();
+  egal(ctx.declencheurs, []);
+  vrai(!ctx.magasins.user.has('RANGEMENT_APPLICATION'));
+  egal(ctx.lire('rangementReprendreApplication')().arrete, true);
+  egal(parentsDe(ctx, 'fNote01'), ['root00']);
+});
+
+verifier('déplacement vers un Drive partagé : constaté seulement quand Drive le dit', () => {
+  const { ctx, feuille, classeur } = preparerPlan();
+  cocher(feuille);
+  vrai(appliquerTout(ctx).ok);
+  const manuel = () => lignesDe(classeur.getSheetByName('À déplacer dans Drive'))[0];
+  vrai(ctx.lire('rangementVerifierDeplacements')().ok);
+  egal(manuel()['État'], 'À faire');
+  ctx.fichiers.find((f) => f.id === 'dAlpha').driveId = ctx.ecritures.drivesCrees[0].id;
+  vrai(ctx.lire('rangementVerifierDeplacements')().ok);
+  egal(manuel()['État'], 'Fait (constaté)');
+  egal(manuel()['ID Drive'], ctx.ecritures.drivesCrees[0].id);
+});
+
+verifier('le faux Drive refuse de déplacer un dossier vers un Drive partagé, comme le vrai', () => {
+  const { ctx } = preparerPlan();
+  ctx.sandbox.Drive.Drives.create({ name: 'Essai' }, 'jeton-essai');
+  const drive = ctx.drivesPartages.find((d) => d.name === 'Essai');
+  let message = '';
+  try {
+    ctx.sandbox.Drive.Files.update({}, 'dAlpha', null, { addParents: drive.id, removeParents: 'root00', supportsAllDrives: true });
+  } catch (e) { message = e.message; }
+  contient(message, 'Moving folders into shared drives is not supported');
 });
 
 /* --------------------------------------------------------------------------

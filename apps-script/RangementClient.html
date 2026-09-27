@@ -27,6 +27,10 @@
     filtreGravite: 'tous',
     filtreAction: 'tous',
     ia: { taille: 200, consentement: false, enCours: false, resultat: null, resume: null, erreur: '' },
+    plan: {
+      preparation: false, prepare: null, erreur: '', etat: null,
+      application: { enCours: false, arret: false, confirmation: false, bilan: null, message: '', verification: false },
+    },
   };
 
   /* ------------------------------------------------------------ outils d'affichage */
@@ -60,9 +64,12 @@
 
   const MOIS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août',
     'septembre', 'octobre', 'novembre', 'décembre'];
-  /** « 6 septembre 2026 » : la conversion appartient à l'affichage, jamais à la donnée. */
+  /**
+   * « 6 septembre 2026 » : la conversion appartient à l'affichage, jamais à la
+   * donnée. Accepte un jour `yyyy-MM-dd` ou un horodatage qui en commence un.
+   */
   const dateLisible = (jour) => {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(jour || ''));
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:$| \d{2}:\d{2})/.exec(String(jour || ''));
     return m ? `${Number(m[3])} ${MOIS[Number(m[2]) - 1]} ${m[1]}` : '';
   };
 
@@ -103,8 +110,13 @@
       etat.contexte = await socle.demander('rangementDemarrer');
       const c = etat.contexte;
       remplacer($('qui'), `${c.nom} — ${c.adresse}`);
-      remplacer($('pied'), `Rangement Drive v${c.version} · lecture seule · `,
+      remplacer($('pied'), `Rangement Drive v${c.version} · rien n'est modifié sans votre validation · `,
         el('a', { href: '#', onclick: (ev) => { ev.preventDefault(); ouvrirOnglet('aide'); } }, 'aide et fonctionnement'));
+      if (c.plan) {
+        remplacer($('accueil-plan'), bandeau(null,
+          `Un plan de rangement préparé le ${dateLisible(c.plan.cree)} vous attend. `,
+          el('button', { classe: 's-bouton s-bouton--discret', onclick: () => ouvrirOnglet('application') }, 'Ouvrir l\'application du plan')));
+      }
       montrer('ecran-accueil', true);
     } catch (erreur) {
       remplacer($('erreur-generale'), bandeau('critique',
@@ -219,6 +231,7 @@
     ['drives', 'Drives partagés'],
     ['constats', 'Constats'],
     ['hierarchie', 'Hiérarchie proposée'],
+    ['application', 'Application'],
     ['ia', 'Proposition IA'],
     ['reglages', 'Réglages'],
     ['aide', 'Aide'],
@@ -239,13 +252,13 @@
 
   const ouvrirOnglet = (cle) => {
     etat.onglet = cle;
-    if (!etat.rapport && !['aide', 'reglages'].includes(cle)) return;
+    if (!etat.rapport && !['aide', 'reglages', 'application'].includes(cle)) return;
     if (etat.rapport) afficherOnglets();
     if (!etat.rapport) {
       montrer('ecran-accueil', false);
       montrer('ecran-rapport', true);
     }
-    const rendus = { synthese, drives, constats, hierarchie, ia, reglages, aide };
+    const rendus = { synthese, drives, constats, hierarchie, application, ia, reglages, aide };
     // Avant toute analyse, l'aide et les réglages s'ouvrent sans onglets : il
     // faut un chemin de retour vers l'accueil.
     const retour = etat.rapport ? null : el('div', null, el('button', {
@@ -424,9 +437,10 @@
     const h = etat.rapport.hierarchie;
     const mouvements = h.mouvements.filter((m) => etat.filtreAction === 'tous' || m.action === etat.filtreAction);
     return [
+      cartePlan(),
       carte(el('h2', { classe: 's-sous-titre' }, 'L\'arborescence qui en résulterait'),
         el('p', { classe: 's-legende' }, 'Premier niveau seulement. En italique, les dossiers à créer. '
-          + 'Rien n\'est appliqué : c\'est un plan à relire, et les déplacements se font dans Drive.'),
+          + 'Rien n\'est appliqué sans un plan que vous aurez relu et coché (ci-dessus).'),
         el('ul', { classe: 'r-arbre' },
           el('li', null, el('strong', null, 'Mon Drive'), el('ul', null,
             h.monDrive.map((n) => el('li', { classe: n.genre === 'nouveau' ? 'r-nouveau' : '' },
@@ -454,6 +468,252 @@
       mouvements.length > 500 ? el('p', { classe: 's-legende' },
         `${nombre(mouvements.length - 500)} mouvements de plus, non affichés : l'export CSV les contient tous.`) : null,
     ];
+  };
+
+
+  /* ------------------------------------------------------------ plan puis application (v0.2) */
+
+  const attendre = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+  /** L'appel à l'action, en tête de la hiérarchie : ce qui sera fait, et ce qui ne le sera pas. */
+  const cartePlan = () => {
+    const p = RangementAnalyse.propositionDePlan(etat.rapport);
+    const prepare = etat.plan.prepare;
+    return carte(
+      el('h2', { classe: 's-sous-titre' }, 'Passer au rangement'),
+      el('p', null, 'L\'outil peut faire ces rangements pour vous. Il écrit d\'abord un plan dans un classeur Google '
+        + 'Sheets, dans votre Drive : rien ne se fait tant que vous n\'avez pas coché, ligne par ligne, ce que vous approuvez.'),
+      el('ul', null,
+        el('li', null, `${pluriel(p.mouvements.length, 'déplacement', 'déplacements')} dans Mon Drive, que l'outil appliquera ;`),
+        el('li', null, `${pluriel(p.drivesACreer.length, 'Drive partagé', 'Drives partagés')} à créer, avec `
+          + `${pluriel(p.drivesACreer.reduce((n, d) => n + d.membres.length, 0), 'membre', 'membres')} à y ajouter ;`),
+        el('li', null, `${pluriel(p.deplacementsManuels.length, 'dossier', 'dossiers')} à faire glisser vous-même vers un Drive partagé : `
+          + 'Google ne permet pas de le faire par programme, et son interface garde les liens intacts ;'),
+        el('li', null, `${pluriel(p.nonAutomatiques, 'simplification', 'simplifications')} (niveaux inutiles, fusions) à faire à la main : `
+          + 'ce sont des présomptions sur la structure, l\'outil ne les applique pas.')),
+      el('p', { classe: 's-legende' }, 'Aucune suppression, aucune mise à la corbeille, aucun renommage : l\'outil déplace, crée des dossiers, '
+        + 'crée des Drives partagés et y ajoute des membres. Rien d\'autre.'),
+      etat.plan.erreur ? bandeau('critique', etat.plan.erreur) : null,
+      prepare ? bandeau('bon', `Plan écrit : ${pluriel(prepare.lignes, 'ligne', 'lignes')} à relire. `,
+        el('a', { href: prepare.url, target: '_blank', rel: 'noopener' }, 'Ouvrir le plan dans Sheets'),
+        ', cochez ce que vous approuvez, puis revenez à l\'onglet « Application ».') : null,
+      el('div', { classe: 's-rangee' },
+        el('button', {
+          classe: `s-bouton${prepare ? '' : ' s-bouton--primaire'}`,
+          disabled: etat.plan.preparation || (p.mouvements.length + p.drivesACreer.length + p.deplacementsManuels.length === 0),
+          onclick: preparerPlan,
+        }, etat.plan.preparation ? 'Écriture du plan…' : (prepare ? 'Préparer un nouveau plan' : 'Préparer le plan')),
+        prepare ? el('button', { classe: 's-bouton s-bouton--primaire', onclick: () => ouvrirOnglet('application') }, 'Aller à l\'application') : null));
+  };
+
+  const preparerPlan = async () => {
+    if (etat.plan.prepare && !window.confirm('Un nouveau plan remplace le précédent, et arrête son application si elle est en cours. '
+      + 'Le classeur de l\'ancien plan reste dans votre Drive. Continuer ?')) return;
+    etat.plan.preparation = true;
+    etat.plan.erreur = '';
+    ouvrirOnglet('hierarchie');
+    try {
+      etat.plan.prepare = await socle.demander('rangementPreparerPlan', [RangementAnalyse.propositionDePlan(etat.rapport)]);
+      etat.contexte.plan = { id: etat.plan.prepare.id, url: etat.plan.prepare.url, cree: etat.plan.prepare.cree };
+    } catch (erreur) {
+      etat.plan.erreur = erreurLisible(erreur);
+    }
+    etat.plan.preparation = false;
+    ouvrirOnglet('hierarchie');
+  };
+
+  /** L'onglet se dessine tout de suite, puis se remplit quand l'état du plan arrive. */
+  const application = () => {
+    const conteneur = el('div', { classe: 's-pile', id: 'application-contenu' }, carte(el('p', null, 'Lecture du plan…')));
+    chargerEtatPlan();
+    return conteneur;
+  };
+
+  const chargerEtatPlan = async () => {
+    try {
+      etat.plan.etat = await socle.demander('rangementEtatPlan');
+      etat.plan.erreur = '';
+    } catch (erreur) {
+      etat.plan.erreur = erreurLisible(erreur);
+    }
+    rendreApplication();
+  };
+
+  const rendreApplication = () => {
+    const cible = $('application-contenu');
+    if (cible) remplacer(cible, contenuApplication());
+  };
+
+  const ETATS_MANUELS = { 'Fait (constaté)': 'bon', 'À faire': 'avertissement' };
+
+  const contenuApplication = () => {
+    const e = etat.plan.etat;
+    const a = etat.plan.application;
+    if (etat.plan.erreur && !e) return [bandeau('critique', etat.plan.erreur)];
+    if (!e || !e.plan) {
+      return [carte(el('p', null, 'Aucun plan de rangement n\'a été préparé.'),
+        el('p', { classe: 's-legende' }, 'Lancez l\'analyse, puis « Préparer le plan » dans l\'onglet Hiérarchie proposée.'))];
+    }
+    const actions = Object.entries(e.parAction);
+    const blocs = [
+      carte(
+        el('div', { classe: 'r-entete' },
+          el('h2', { classe: 's-sous-titre' }, `Plan du ${dateLisible(e.plan.cree)}`),
+          el('a', { href: e.plan.url, target: '_blank', rel: 'noopener' }, 'Ouvrir le plan dans Sheets')),
+        el('div', { classe: 's-grille' },
+          chiffre(nombre(e.lignes), 'lignes dans le plan', 'onglet « Plan » du classeur'),
+          chiffre(nombre(e.validees), 'lignes cochées', 'colonne « Valider »'),
+          chiffre(nombre(e.aTraiter), 'lignes à appliquer', 'cochées, et pas encore faites')),
+        el('p', { classe: 's-legende' }, 'État des lignes : ',
+          Object.entries(e.parEtat).map(([k, n]) => `${k} (${n})`).join(' · ')),
+        etat.plan.erreur ? bandeau('critique', etat.plan.erreur) : null),
+    ];
+
+    if (a.enCours) {
+      const total = (a.bilan && a.bilan.confirme) || a.confirme || e.aTraiter;
+      const faites = Math.max(0, total - e.aTraiter);
+      blocs.push(carte(
+        el('h2', { classe: 's-sous-titre' }, 'Application en cours…'),
+        el('div', { classe: 's-progression', role: 'progressbar', 'aria-valuenow': faites, 'aria-valuemax': total },
+          el('div', { classe: 's-progression__part', style: `width: ${total ? Math.round((100 * faites) / total) : 0}%` })),
+        el('p', { classe: 's-chiffres' }, `${nombre(faites)} sur ${nombre(total)} · ${pluriel(e.aTraiter, 'ligne restante', 'lignes restantes')}`),
+        el('p', { classe: 's-legende' }, 'Chaque ligne est marquée dans le plan au moment où elle est traitée. Si vous fermez cette fenêtre, '
+          + 'l\'application se poursuit en arrière-plan, à votre nom, par tranches de quelques minutes.'),
+        a.message ? bandeau('avertissement', a.message) : null,
+        el('button', { classe: 's-bouton', onclick: arreterApplication }, 'Arrêter')));
+    } else if (e.enCours) {
+      blocs.push(carte(
+        bandeau('avertissement', `Une application a été lancée le ${e.enCours.depuis} et se poursuit en arrière-plan.`),
+        el('div', { classe: 's-rangee' },
+          el('button', { classe: 's-bouton s-bouton--primaire', onclick: () => executer() }, 'La suivre ici'),
+          el('button', { classe: 's-bouton', onclick: arreterApplication }, 'Arrêter'))));
+    } else if (e.aTraiter > 0) {
+      blocs.push(carte(
+        el('h2', { classe: 's-sous-titre' }, 'Appliquer'),
+        el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+          el('thead', null, el('tr', null, el('th', null, 'Action'), el('th', null, 'Lignes'))),
+          el('tbody', null, actions.map(([action, n]) => el('tr', null, el('td', null, action), el('td', { classe: 's-nombre' }, nombre(n))))))),
+        e.notifications ? bandeau('avertissement', `${pluriel(e.notifications, 'personne sera ajoutée', 'personnes seront ajoutées')} à un Drive partagé : `
+          + 'Google leur enverra une notification par courriel.') : null,
+        el('p', { classe: 's-legende' }, 'Réversible : un déplacement dans Mon Drive se défait dans Drive, et le plan garde l\'emplacement d\'origine de chaque élément. '
+          + 'Un Drive partagé créé se supprime depuis Drive, une fois vidé.'),
+        el('label', { classe: 's-rangee' },
+          el('input', { type: 'checkbox', checked: a.confirmation, onchange: (ev) => { a.confirmation = ev.target.checked; rendreApplication(); } }),
+          `J'ai relu le plan : appliquer les ${pluriel(e.aTraiter, 'ligne cochée', 'lignes cochées')}.`),
+        a.message ? bandeau('critique', a.message) : null,
+        el('button', {
+          classe: 's-bouton s-bouton--primaire', disabled: !a.confirmation,
+          onclick: () => executer(e.aTraiter),
+        }, `Appliquer ${pluriel(e.aTraiter, 'ligne', 'lignes')}`)));
+    } else {
+      blocs.push(carte(
+        el('p', null, e.validees === 0
+          ? 'Aucune ligne n\'est cochée. Ouvrez le plan dans Sheets, cochez « Valider » sur ce que vous approuvez, puis revenez ici.'
+          : 'Toutes les lignes cochées ont été traitées.'),
+        a.message ? bandeau(null, a.message) : null,
+        el('div', { classe: 's-rangee' },
+          el('button', { classe: 's-bouton', onclick: chargerEtatPlan }, 'Relire le plan'),
+          e.validees > 0 ? el('button', { classe: 's-bouton s-bouton--primaire', onclick: commencer }, 'Relancer l\'analyse') : null)));
+    }
+
+    if (e.echecs.length) {
+      blocs.push(carte(
+        el('h2', { classe: 's-sous-titre' }, `${pluriel(e.echecs.length, 'ligne en échec', 'lignes en échec')}`),
+        el('p', { classe: 's-legende' }, 'Rien n\'a été fait pour ces lignes. Corrigez si besoin, remettez « À faire » dans la colonne État, cochez, et relancez.'),
+        el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+          el('thead', null, el('tr', null, ['Ligne', 'Action', 'Élément', 'Pourquoi'].map((t) => el('th', null, t)))),
+          el('tbody', null, e.echecs.map((x) => el('tr', null,
+            el('td', { classe: 's-nombre' }, x.ligne), el('td', null, x.action), el('td', null, x.element),
+            el('td', { classe: 's-legende' }, x.detail))))))));
+    }
+
+    if (e.manuels.length) {
+      blocs.push(carte(
+        el('h2', { classe: 's-sous-titre' }, 'À faire vous-même dans Drive'),
+        el('p', null, 'Google ne permet pas de déplacer un dossier de Mon Drive vers un Drive partagé par programme. Dans Drive, '
+          + 'faites glisser chaque dossier vers son Drive partagé (ou clic droit > Organiser > Déplacer). Le dossier garde son '
+          + 'adresse, et Google laisse en place, avec un raccourci, les fichiers de personnes extérieures.'),
+        el('div', { classe: 's-tableau-defilant' }, el('table', { classe: 's-tableau' },
+          el('thead', null, el('tr', null, ['Dossier', 'Vers', 'État', 'Remarque'].map((t) => el('th', null, t)))),
+          el('tbody', null, e.manuels.map((m) => el('tr', null,
+            el('td', null, el('a', { href: `https://drive.google.com/drive/folders/${encodeURIComponent(m.idDossier)}`, target: '_blank', rel: 'noopener' }, m.dossier)),
+            el('td', null, m.idDrive
+              ? el('a', { href: `https://drive.google.com/drive/folders/${encodeURIComponent(m.idDrive)}`, target: '_blank', rel: 'noopener' }, m.drive)
+              : el('span', { classe: 's-non-mesure' }, `${m.drive} (à créer : cochez sa ligne dans le plan)`)),
+            el('td', null, el('span', { classe: `s-etat s-etat--${ETATS_MANUELS[m.etat] || 'neutre'}` }, m.etat || 'À faire'),
+              m.verifie ? el('div', { classe: 's-legende' }, `vérifié le ${dateLisible(m.verifie)}`) : null),
+            el('td', { classe: 's-legende' }, m.remarque)))))),
+        el('button', {
+          classe: 's-bouton', disabled: a.verification, onclick: verifierManuels,
+        }, a.verification ? 'Vérification…' : 'Vérifier les déplacements')));
+    }
+    return blocs;
+  };
+
+  /**
+   * Lance (avec le nombre confirmé) ou suit une application, passage après
+   * passage. Un refus de verrou veut dire qu'un autre onglet ou le
+   * déclencheur de reprise travaille : on attend, on ne force pas.
+   */
+  const executer = async (confirme) => {
+    const a = etat.plan.application;
+    Object.assign(a, { enCours: true, arret: false, message: '', confirme: confirme || (etat.plan.etat && etat.plan.etat.aTraiter) });
+    rendreApplication();
+    try {
+      let r = confirme !== undefined
+        ? await socle.demander('rangementLancerApplication', [confirme])
+        : await socle.demander('rangementPoursuivreApplication');
+      for (let attentes = 0; !a.arret;) {
+        if (r.refus === 'verrou') {
+          attentes += 1;
+          if (attentes > 30) { a.message = 'Une autre application occupe le plan depuis plus de cinq minutes : réessayez plus tard.'; break; }
+          a.message = 'Une autre application tourne (autre onglet ou arrière-plan) : nouvelle tentative dans 10 secondes.';
+          rendreApplication();
+          await attendre(10000);
+        } else if (r.arrete || r.refus || !r.restant) {
+          break;
+        } else {
+          a.message = '';
+          etat.plan.etat = await socle.demander('rangementEtatPlan');
+          rendreApplication();
+        }
+        r = await socle.demander('rangementPoursuivreApplication');
+      }
+      a.bilan = r;
+      if (r && r.restant === 0) a.message = 'Application terminée. Relancez l\'analyse pour voir le nouvel état de votre Drive.';
+    } catch (erreur) {
+      a.message = erreurLisible(erreur);
+    }
+    a.enCours = false;
+    a.confirmation = false;
+    await chargerEtatPlan();
+  };
+
+  const arreterApplication = async () => {
+    const a = etat.plan.application;
+    a.arret = true;
+    try {
+      await socle.demander('rangementArreterApplication');
+      a.message = 'Application arrêtée. Les lignes déjà traitées le restent ; les autres attendent dans le plan.';
+    } catch (erreur) {
+      a.message = erreurLisible(erreur);
+    }
+    a.enCours = false;
+    await chargerEtatPlan();
+  };
+
+  const verifierManuels = async () => {
+    const a = etat.plan.application;
+    a.verification = true;
+    rendreApplication();
+    try {
+      const r = await socle.demander('rangementVerifierDeplacements');
+      a.message = `${pluriel(r.deplaces, 'dossier constaté', 'dossiers constatés')} dans son Drive partagé, sur ${r.verifies}.`;
+    } catch (erreur) {
+      a.message = erreurLisible(erreur);
+    }
+    a.verification = false;
+    await chargerEtatPlan();
   };
 
   /* ------------------------------------------------------------ IA */
@@ -634,7 +894,10 @@
       carte(el('h2', { classe: 's-sous-titre' }, 'Ce que l\'outil lit, et ce qu\'il ne fait pas'),
         el('ul', null,
           el('li', null, 'Il lit les métadonnées de Mon Drive et de « Partagés avec moi » : noms, dossiers, dates, propriétaires, partages. Jamais le contenu.'),
-          el('li', null, 'Il ne modifie rien : son autorisation Google est en lecture seule. Les rangements, c\'est vous qui les faites.'),
+          el('li', null, 'L\'analyse ne modifie rien. Le rangement ne se fait que sur un plan écrit dans un classeur Sheets, relu et coché ligne par ligne par vous, '
+            + 'et après confirmation du nombre exact de lignes.'),
+          el('li', null, 'L\'outil déplace, crée des dossiers, crée des Drives partagés et y ajoute des membres. Jamais de suppression, de mise à la corbeille ni de renommage.'),
+          el('li', null, 'Avant chaque action, il relit l\'état réel : un élément déplacé depuis la préparation du plan est laissé où il est.'),
           el('li', null, 'L\'analyse tourne dans votre navigateur. Rien n\'est conservé après la fermeture de la page, sauf vos réglages.'),
           el('li', null, 'Les éléments partagés avec vous mais hors de votre arborescence sont lus puis mis de côté : ce n\'est pas à vous de les ranger.'))),
       carte(el('h2', { classe: 's-sous-titre' }, 'Le score « Drive partagé »'),
